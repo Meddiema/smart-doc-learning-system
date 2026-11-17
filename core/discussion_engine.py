@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+import json
 from core.ai_client import AIClient
 
 PERSONAS = {
@@ -31,61 +31,62 @@ class DiscussionEngine:
         self.ai = AIClient()
 
     def run_roundtable(self, topic: str, context: str = "") -> dict:
-        """Runs a 3-stage multi-AI discussion: Parallel Perspectives -> Cross-Debate -> Final Summary."""
+        """Runs a fast 2-call multi-AI discussion: All 3 Perspectives -> Debate + Summary."""
+        # Trim context to 4,000 chars so free-tier token processing stays fast
+        trimmed_context = context.strip()[:4000]
         base_prompt = f"Topic / Question: {topic}"
-        if context.strip():
-            base_prompt += f"\n\nReference Context from Document:\n{context}"
+        if trimmed_context:
+            base_prompt += f"\n\nReference Context from Document:\n{trimmed_context}"
 
-        # Stage 1: Independent Perspectives (executed in parallel for ~3x faster load)
-        tasks = {
-            "technical": (
-                f"{base_prompt}\n\nProvide your technical breakdown and a brief code example.",
-                PERSONAS["technical"]["system"],
-            ),
-            "analogy": (
-                f"{base_prompt}\n\nExplain this simply with a relatable analogy.",
-                PERSONAS["analogy"]["system"],
-            ),
-            "big_picture": (
-                f"{base_prompt}\n\nExplain why this matters architecturally and what best practices apply.",
-                PERSONAS["big_picture"]["system"],
-            ),
-        }
+        # Call 1: Generate all 3 independent persona takes in a single fast JSON response
+        perspectives_prompt = (
+            f"{base_prompt}\n\n"
+            "Respond ONLY with valid JSON (no markdown fences) containing exactly these three keys:\n"
+            '- "technical": Concise breakdown from AI-1 (Technical Expert) with exact syntax and a short code snippet.\n'
+            '- "analogy": Plain-English explanation from AI-2 (Analogy Tutor) using a vivid real-world analogy.\n'
+            '- "big_picture": Architectural view from AI-3 (System Architect) covering system design, security, and best practices.\n'
+            "Keep each perspective focused and under 180 words."
+        )
+        raw_perspectives = self.ai.ask(
+            perspectives_prompt,
+            system_instruction="You simulate three distinct engineering experts. Output strictly valid JSON."
+        )
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                key: executor.submit(self.ai.ask, prompt, sys_inst)
-                for key, (prompt, sys_inst) in tasks.items()
-            }
-            results = {key: future.result() for key, future in futures.items()}
+        # Parse JSON safely with fallback if model wraps in markdown fences
+        cleaned_json = raw_perspectives.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            takes = json.loads(cleaned_json)
+            tech_take = takes.get("technical", raw_perspectives)
+            analogy_take = takes.get("analogy", "")
+            arch_take = takes.get("big_picture", "")
+        except json.JSONDecodeError:
+            tech_take = raw_perspectives
+            analogy_take = "*(Combined into main response above)*"
+            arch_take = "*(Combined into main response above)*"
 
-        tech_take = results["technical"]
-        analogy_take = results["analogy"]
-        arch_take = results["big_picture"]
-
-        # Stage 2: Cross-Critique & Debate
-        debate_prompt = (
+        # Call 2: Generate both the Cross-Debate and Markdown Summary Table in one pass
+        synthesis_prompt = (
             f"Topic: {topic}\n\n"
-            f"AI-1 (Technical) said:\n{tech_take}\n\n"
-            f"AI-2 (Analogy) said:\n{analogy_take}\n\n"
-            f"AI-3 (Architect) said:\n{arch_take}\n\n"
-            "Write a short, lively 4-line roundtable exchange where the three AIs directly address each other, "
-            "point out one nuance or pitfall the others missed, and refine the explanation."
+            f"AI-1 (Technical):\n{tech_take}\n\n"
+            f"AI-2 (Analogy):\n{analogy_take}\n\n"
+            f"AI-3 (Architect):\n{arch_take}\n\n"
+            "Respond ONLY with valid JSON (no markdown fences) containing two keys:\n"
+            '- "debate": A lively 4-line roundtable exchange where AI-1, AI-2, and AI-3 directly address each other and highlight one pitfall.\n'
+            '- "summary": A concise Markdown table with columns: Key Concept | Core Rule | #1 Common Mistake | Practical Takeaway.'
         )
-        debate = self.ai.ask(
-            debate_prompt,
-            system_instruction="Simulate a sharp, collaborative engineering roundtable between AI-1, AI-2, and AI-3."
+        raw_synthesis = self.ai.ask(
+            synthesis_prompt,
+            system_instruction="Simulate a sharp engineering roundtable and summary table. Output strictly valid JSON."
         )
 
-        # Stage 3: Final Actionable Summary
-        summary_prompt = (
-            f"Based on the full roundtable discussion below about '{topic}', create a concise Markdown summary table "
-            "covering: Key Concept, Core Rule, #1 Common Mistake, and Practical Takeaway.\n\n"
-            f"Technical Breakdown:\n{tech_take}\n\n"
-            f"Architectural View:\n{arch_take}\n\n"
-            f"Roundtable Debate:\n{debate}"
-        )
-        summary = self.ai.ask(summary_prompt)
+        cleaned_syn = raw_synthesis.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            syn = json.loads(cleaned_syn)
+            debate = syn.get("debate", raw_synthesis)
+            summary = syn.get("summary", "")
+        except json.JSONDecodeError:
+            debate = raw_synthesis
+            summary = ""
 
         return {
             "technical": tech_take,
