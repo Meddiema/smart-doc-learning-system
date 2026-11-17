@@ -1,5 +1,7 @@
 import streamlit as st
 from database.auth_db import authenticate_user, register_user
+from core.security import verify_invite_code, can_register_new_user
+
 
 def render_auth_view():
     """Render the login and registration screen."""
@@ -32,14 +34,25 @@ def render_auth_view():
                 new_user = st.text_input("Choose a Username", placeholder="e.g., meddie")
                 new_pass = st.text_input("Choose a Password", type="password", placeholder="Minimum 6 characters")
                 confirm_pass = st.text_input("Confirm Password", type="password", placeholder="Re-enter password")
+                invite_code = st.text_input(
+                    "Authorized Access Code",
+                    type="password",
+                    placeholder="Enter access code provided by admin",
+                )
                 reg_submitted = st.form_submit_button("Create Account", use_container_width=True)
 
                 if reg_submitted:
-                    if new_pass != confirm_pass:
+                    if not verify_invite_code(invite_code):
+                        st.error("🚫 Unauthorized: Invalid Access Code. Contact the system administrator.")
+                    elif new_pass != confirm_pass:
                         st.error("Passwords do not match.")
                     else:
-                        ok, msg = register_user(new_user, new_pass)
-                        if ok:
-                            st.success(msg)
+                        allowed, cap_msg = can_register_new_user()
+                        if not allowed:
+                            st.error(f"🚫 {cap_msg}")
                         else:
-                            st.error(msg)
+                            ok, msg = register_user(new_user, new_pass)
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)

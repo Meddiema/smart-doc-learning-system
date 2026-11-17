@@ -38,7 +38,7 @@ class DiscussionEngine:
         if trimmed_context:
             base_prompt += f"\n\nReference Context from Document:\n{trimmed_context}"
 
-        # Call 1: Generate all 3 independent persona takes in a single fast JSON response
+        # Call 1: Enforces per-user cooldown + global RPM cap
         perspectives_prompt = (
             f"{base_prompt}\n\n"
             "Respond ONLY with valid JSON (no markdown fences) containing exactly these three keys:\n"
@@ -52,6 +52,16 @@ class DiscussionEngine:
             system_instruction="You simulate three distinct engineering experts. Output strictly valid JSON."
         )
 
+        # If blocked by cooldown or rate-limit protection, return immediately without making Call 2
+        if raw_perspectives.startswith(("🛑", "⚠️")):
+            return {
+                "technical": raw_perspectives,
+                "analogy": "",
+                "big_picture": "",
+                "debate": "",
+                "summary": ""
+            }
+
         # Parse JSON safely with fallback if model wraps in markdown fences
         cleaned_json = raw_perspectives.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
@@ -64,7 +74,7 @@ class DiscussionEngine:
             analogy_take = "*(Combined into main response above)*"
             arch_take = "*(Combined into main response above)*"
 
-        # Call 2: Generate both the Cross-Debate and Markdown Summary Table in one pass
+        # Call 2: Bypasses per-user cooldown (part of the same action), still obeys global RPM cap
         synthesis_prompt = (
             f"Topic: {topic}\n\n"
             f"AI-1 (Technical):\n{tech_take}\n\n"
@@ -76,8 +86,18 @@ class DiscussionEngine:
         )
         raw_synthesis = self.ai.ask(
             synthesis_prompt,
-            system_instruction="Simulate a sharp engineering roundtable and summary table. Output strictly valid JSON."
+            system_instruction="Simulate a sharp engineering roundtable and summary table. Output strictly valid JSON.",
+            bypass_user_cooldown=True
         )
+
+        if raw_synthesis.startswith(("🛑", "⚠️")):
+            return {
+                "technical": tech_take,
+                "analogy": analogy_take,
+                "big_picture": arch_take,
+                "debate": raw_synthesis,
+                "summary": ""
+            }
 
         cleaned_syn = raw_synthesis.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
