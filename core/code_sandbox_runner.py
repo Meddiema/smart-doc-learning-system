@@ -3,6 +3,7 @@ import sys
 import tempfile
 import os
 
+
 def run_python_code(code: str, timeout: int = 5) -> dict:
     """Executes Python code in a temporary file with a timeout and captures output/errors."""
     if not code.strip():
@@ -14,11 +15,18 @@ def run_python_code(code: str, timeout: int = 5) -> dict:
             tmp.write(code)
             temp_path = tmp.name
 
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         result = subprocess.run(
-            [sys.executable, temp_path],
+            [sys.executable, "-u", temp_path],
+            input="",
             capture_output=True,
             text=True,
-            timeout=timeout
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env
         )
         return {
             "success": result.returncode == 0,

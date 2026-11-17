@@ -1,3 +1,4 @@
+import re
 from core.ai_client import AIClient
 
 GENERATOR_SYSTEM_PROMPT = """
@@ -6,6 +7,7 @@ Given a programming concept or documentation snippet, output ONLY clean, self-co
 runnable code with brief inline comments demonstrating the concept. 
 Do not wrap the response in long prose—keep it focused on practical, testable code.
 """
+
 
 class CodeGenerator:
     def __init__(self):
@@ -17,4 +19,7 @@ class CodeGenerator:
             f"Concept / Context:\n{concept}\n\n"
             "Write a short, runnable example I can test right now."
         )
-        return self.ai.ask(prompt, system_instruction=GENERATOR_SYSTEM_PROMPT)
+        raw_output = self.ai.ask(prompt, system_instruction=GENERATOR_SYSTEM_PROMPT)
+        # Strip markdown fences if the model includes them so the sandbox runs cleanly
+        cleaned = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", raw_output.strip())
+        return cleaned

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from core.ai_client import AIClient
 
 PERSONAS = {
@@ -24,29 +25,43 @@ PERSONAS = {
     }
 }
 
+
 class DiscussionEngine:
     def __init__(self):
         self.ai = AIClient()
 
     def run_roundtable(self, topic: str, context: str = "") -> dict:
-        """Runs a 3-stage multi-AI discussion: Independent Takes -> Cross-Debate -> Final Summary."""
+        """Runs a 3-stage multi-AI discussion: Parallel Perspectives -> Cross-Debate -> Final Summary."""
         base_prompt = f"Topic / Question: {topic}"
         if context.strip():
             base_prompt += f"\n\nReference Context from Document:\n{context}"
 
-        # Stage 1: Independent Perspectives
-        tech_take = self.ai.ask(
-            f"{base_prompt}\n\nProvide your technical breakdown and a brief code example.",
-            system_instruction=PERSONAS["technical"]["system"]
-        )
-        analogy_take = self.ai.ask(
-            f"{base_prompt}\n\nExplain this simply with a relatable analogy.",
-            system_instruction=PERSONAS["analogy"]["system"]
-        )
-        arch_take = self.ai.ask(
-            f"{base_prompt}\n\nExplain why this matters architecturally and what best practices apply.",
-            system_instruction=PERSONAS["big_picture"]["system"]
-        )
+        # Stage 1: Independent Perspectives (executed in parallel for ~3x faster load)
+        tasks = {
+            "technical": (
+                f"{base_prompt}\n\nProvide your technical breakdown and a brief code example.",
+                PERSONAS["technical"]["system"],
+            ),
+            "analogy": (
+                f"{base_prompt}\n\nExplain this simply with a relatable analogy.",
+                PERSONAS["analogy"]["system"],
+            ),
+            "big_picture": (
+                f"{base_prompt}\n\nExplain why this matters architecturally and what best practices apply.",
+                PERSONAS["big_picture"]["system"],
+            ),
+        }
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                key: executor.submit(self.ai.ask, prompt, sys_inst)
+                for key, (prompt, sys_inst) in tasks.items()
+            }
+            results = {key: future.result() for key, future in futures.items()}
+
+        tech_take = results["technical"]
+        analogy_take = results["analogy"]
+        arch_take = results["big_picture"]
 
         # Stage 2: Cross-Critique & Debate
         debate_prompt = (
@@ -64,9 +79,11 @@ class DiscussionEngine:
 
         # Stage 3: Final Actionable Summary
         summary_prompt = (
-            f"Based on the discussion below about '{topic}', create a concise Markdown summary table "
+            f"Based on the full roundtable discussion below about '{topic}', create a concise Markdown summary table "
             "covering: Key Concept, Core Rule, #1 Common Mistake, and Practical Takeaway.\n\n"
-            f"Discussion:\n{debate}"
+            f"Technical Breakdown:\n{tech_take}\n\n"
+            f"Architectural View:\n{arch_take}\n\n"
+            f"Roundtable Debate:\n{debate}"
         )
         summary = self.ai.ask(summary_prompt)
 
