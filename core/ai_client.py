@@ -39,24 +39,25 @@ class AIClient:
         )
         self.models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
-    def _check_and_reserve_slot(self) -> tuple[bool, str]:
+    def _check_and_reserve_slot(self, bypass_user_cooldown: bool = False) -> tuple[bool, str]:
         """
-        Blocks rapid per-user clicks AND enforces the server-wide RPM ceiling
-        BEFORE sending any request to Gemini.
+        Blocks rapid per-user clicks (unless bypassed internally for multi-step pipelines)
+        AND enforces the server-wide RPM ceiling BEFORE sending any request to Gemini.
         """
         now = time.time()
 
         # 1. Per-user rapid-click guard (blocks double-clicks / button spam)
-        try:
-            last_user_call = st.session_state.get("_last_ai_request_ts", 0.0)
-            user_wait = MIN_SECONDS_BETWEEN_USER_CALLS - (now - last_user_call)
-            if user_wait > 0:
-                return (
-                    False,
-                    f"🛑 Slow down: please wait {int(user_wait) + 1} seconds before sending another request.",
-                )
-        except Exception:
-            pass
+        if not bypass_user_cooldown:
+            try:
+                last_user_call = st.session_state.get("_last_ai_request_ts", 0.0)
+                user_wait = MIN_SECONDS_BETWEEN_USER_CALLS - (now - last_user_call)
+                if user_wait > 0:
+                    return (
+                        False,
+                        f"🛑 Slow down: please wait {int(user_wait) + 1} seconds before sending another request.",
+                    )
+            except Exception:
+                pass
 
         # 2. Global server-wide per-minute guard (blocks multi-user bursts)
         limiter = _get_global_rate_limiter()
@@ -82,9 +83,17 @@ class AIClient:
 
         return True, ""
 
-    def _generate_with_retry(self, contents, system_instruction: str = None, max_retries: int = 2) -> str:
+    def _generate_with_retry(
+        self,
+        contents,
+        system_instruction: str = None,
+        max_retries: int = 2,
+        bypass_user_cooldown: bool = False,
+    ) -> str:
         """Blocks rapid requests up front, then calls Gemini with fast failover."""
-        allowed, block_message = self._check_and_reserve_slot()
+        allowed, block_message = self._check_and_reserve_slot(
+            bypass_user_cooldown=bypass_user_cooldown
+        )
         if not allowed:
             return block_message
 
@@ -113,8 +122,27 @@ class AIClient:
 
         return f"⚠️ AI Error (after retries): {last_error}"
 
-    def ask(self, prompt: str, system_instruction: str = None) -> str:
-        return self._generate_with_retry(contents=prompt, system_instruction=system_instruction)
+    def ask(
+        self,
+        prompt: str,
+        system_instruction: str = None,
+        bypass_user_cooldown: bool = False,
+    ) -> str:
+        return self._generate_with_retry(
+            contents=prompt,
+            system_instruction=system_instruction,
+            bypass_user_cooldown=bypass_user_cooldown,
+        )
 
-    def ask_with_image(self, prompt: str, image: Image.Image, system_instruction: str = None) -> str:
-        return self._generate_with_retry(contents=[image, prompt], system_instruction=system_instruction)
+    def ask_with_image(
+        self,
+        prompt: str,
+        image: Image.Image,
+        system_instruction: str = None,
+        bypass_user_cooldown: bool = False,
+    ) -> str:
+        return self._generate_with_retry(
+            contents=[image, prompt],
+            system_instruction=system_instruction,
+            bypass_user_cooldown=bypass_user_cooldown,
+        )
