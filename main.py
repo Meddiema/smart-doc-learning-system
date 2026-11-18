@@ -16,13 +16,27 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-def load_css(file_path: str = os.path.join("assets", "styles.css")):
+
+@st.cache_data
+def get_css_content(file_path: str = os.path.join("assets", "styles.css")) -> str:
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
-            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+            return f"<style>{f.read()}</style>"
+    return ""
 
-load_css()
-init_db()
+
+@st.cache_resource
+def bootstrap_database() -> bool:
+    """Initialize Turso/SQLite tables once per server startup instead of every rerun."""
+    init_db()
+    return True
+
+
+css_block = get_css_content()
+if css_block:
+    st.markdown(css_block, unsafe_allow_html=True)
+
+bootstrap_database()
 
 # Initialize auth session state
 if "authenticated" not in st.session_state:

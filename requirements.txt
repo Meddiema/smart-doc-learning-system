@@ -3,3 +3,4 @@ pypdf
 google-genai
 pillow
 libsql
+streamlit-browser-session-storage
