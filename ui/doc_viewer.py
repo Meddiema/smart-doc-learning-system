@@ -1,17 +1,22 @@
 import os
+import re
 import json
 import streamlit as st
 from streamlit_session_browser_storage import SessionStorage
 from core.pdf_processor import save_uploaded_pdf, list_saved_pdfs, extract_pdf_pages, UPLOAD_DIR
 from core.ai_client import AIClient
 
-EXPLAINER_SYSTEM_PROMPT = """
-You are an expert software engineering tutor. When given a highlighted snippet from a technical manual or code doc, explain it clearly using this exact structure:
-1. **Plain English Summary** — What it means simply.
-2. **How It Works** — Step-by-step breakdown.
-3. **Where & When to Use It** — Practical real-world use cases.
-4. **Simple Code Example** — Clean, runnable example demonstrating the concept.
-5. **Common Pitfalls** — Mistakes beginners make here.
+TRANSLATOR_SYSTEM_PROMPT = """
+You are an expert software engineering and cybersecurity tutor.
+When given a highlighted snippet from a technical manual, networking guide, or code doc, translate it into THREE formats and return ONLY strictly valid JSON (no markdown fences outside the JSON, no extra commentary):
+
+{
+  "explanation": "Structured markdown explanation covering: 1. Plain English Summary, 2. How It Works, 3. Where & When to Use It, 4. Common Pitfalls.",
+  "code_lang": "python",
+  "code": "Clean, runnable, well-commented code demonstrating the concept (use the most relevant language such as python, csharp, php, sql, or javascript).",
+  "command": "Practical terminal/CLI commands (Linux bash, Windows CMD/PowerShell, Nmap, netstat, curl, git, or CVE lookup) that apply this concept in practice. Always use safe non-destructive targets like 192.168.1.1 or localhost.",
+  "command_notes": "Brief bullet points explaining what each flag/argument in the command does."
+}
 """
 
 DRAFT_KEY = "doc_viewer_temp_draft"
@@ -23,8 +28,38 @@ def _cached_extract_pages(pdf_path: str, file_mtime: float):
     return extract_pdf_pages(pdf_path)
 
 
+def _parse_ai_bundle(raw_response: str) -> dict:
+    """Safely extract JSON fields from the AI response with graceful fallback."""
+    cleaned = raw_response.strip()
+    # Strip optional ```json ... ``` wrapper if the model includes one
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict) and any(k in data for k in ("explanation", "code", "command")):
+            return {
+                "explanation": data.get("explanation", "No explanation generated."),
+                "code_lang": data.get("code_lang", "python") or "python",
+                "code": data.get("code", "# No code snippet applicable for this concept."),
+                "command": data.get("command", "# No terminal command applicable for this concept."),
+                "command_notes": data.get("command_notes", ""),
+            }
+    except Exception:
+        pass
+
+    # Fallback if rate-limit notice or plain markdown was returned
+    return {
+        "explanation": raw_response,
+        "code_lang": "python",
+        "code": "# Switch to Explain view or re-run when rate limit clears.",
+        "command": "# Switch to Explain view or re-run when rate limit clears.",
+        "command_notes": "",
+    }
+
+
 def _restore_browser_draft(session_storage: SessionStorage):
-    """Restore temporary highlight & explanation into session_state after a reconnect."""
+    """Restore temporary highlight, toggle state, and AI outputs after a reconnect."""
     if st.session_state.get("_doc_draft_restored"):
         return
 
@@ -37,8 +72,9 @@ def _restore_browser_draft(session_storage: SessionStorage):
                 st.session_state.setdefault("doc_page_num", int(draft.get("page_num", 1)))
                 st.session_state.setdefault("doc_highlight_input", draft.get("highlighted_text", ""))
                 st.session_state.setdefault("doc_followup_input", draft.get("follow_up", ""))
-                if draft.get("explanation"):
-                    st.session_state.setdefault("last_explanation", draft["explanation"])
+                st.session_state.setdefault("doc_view_mode", draft.get("view_mode", "🔤 Explain"))
+                if draft.get("ai_bundle"):
+                    st.session_state.setdefault("last_ai_bundle", draft["ai_bundle"])
                 st.session_state["_doc_draft_restored"] = True
         except Exception:
             pass
@@ -50,7 +86,8 @@ def _save_browser_draft(
     page_num: int,
     highlighted_text: str,
     follow_up: str,
-    explanation: str,
+    view_mode: str,
+    ai_bundle: dict,
 ):
     """Store active reading state in browser tab memory (auto-clears when tab closes)."""
     payload = {
@@ -58,7 +95,8 @@ def _save_browser_draft(
         "page_num": page_num,
         "highlighted_text": highlighted_text,
         "follow_up": follow_up,
-        "explanation": explanation,
+        "view_mode": view_mode,
+        "ai_bundle": ai_bundle,
     }
     session_storage.setItem(DRAFT_KEY, json.dumps(payload))
 
@@ -98,57 +136,88 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
         st.caption(f"Showing page {page_num} of {total_pages}")
         current_text = pages[page_num - 1]["text"] if pages else ""
         st.text_area(
-            "Extracted Page Text (Copy any section to explain):",
+            "Extracted Page Text (Copy any section to translate or explain):",
             value=current_text,
-            height=420,
+            height=440,
         )
 
     with col_explainer:
         header_col, clear_col = st.columns([3, 1])
         with header_col:
-            st.subheader("💡 Highlight Explainer")
+            st.subheader("💡 Highlight → Code / Command")
         with clear_col:
-            if st.button("🧹 Clear", help="Clear temporary highlight and explanation", use_container_width=True):
-                for k in ("doc_highlight_input", "doc_followup_input", "last_explanation", "_doc_draft_restored"):
+            if st.button("🧹 Clear", help="Clear temporary highlight and output", use_container_width=True):
+                for k in (
+                    "doc_highlight_input",
+                    "doc_followup_input",
+                    "last_ai_bundle",
+                    "doc_view_mode",
+                    "_doc_draft_restored",
+                ):
                     st.session_state.pop(k, None)
                 session_storage.deleteItem(DRAFT_KEY)
                 st.rerun(scope="fragment")
 
         highlighted_text = st.text_area(
-            "Paste the specific paragraph, syntax, or concept you want simplified:",
-            height=150,
+            "Paste plain-English concept, networking step, or syntax:",
+            height=140,
             placeholder="Paste text from the page reader on the left...",
             key="doc_highlight_input",
         )
         follow_up = st.text_input(
-            "Optional specific question:",
-            placeholder="e.g., How does this connect to Flask routes?",
+            "Optional specific question or target language:",
+            placeholder="e.g., Show this in Python sockets or Nmap CLI",
             key="doc_followup_input",
         )
 
-        if st.button("✨ Explain Highlighted Concept", type="primary", use_container_width=True):
+        if st.button("✨ Translate & Explain Concept", type="primary", use_container_width=True):
             if not highlighted_text.strip():
-                st.warning("Paste a snippet first so the AI knows what to explain.")
+                st.warning("Paste a snippet first so the AI knows what to translate.")
             else:
-                with st.spinner("Breaking down concept..."):
+                with st.spinner("Generating Explanation, Code & Command..."):
                     ai = AIClient()
                     prompt = f"Document: {selected_pdf} (Page {page_num})\n\nHighlighted Snippet:\n{highlighted_text}"
                     if follow_up.strip():
-                        prompt += f"\n\nSpecific Question: {follow_up}"
-                    explanation = ai.ask(prompt, system_instruction=EXPLAINER_SYSTEM_PROMPT)
-                    st.session_state["last_explanation"] = explanation
+                        prompt += f"\n\nSpecific Question / Preference: {follow_up}"
+
+                    raw_response = ai.ask(prompt, system_instruction=TRANSLATOR_SYSTEM_PROMPT)
+                    bundle = _parse_ai_bundle(raw_response)
+                    st.session_state["last_ai_bundle"] = bundle
+
+                    active_mode = st.session_state.get("doc_view_mode", "🔤 Explain")
                     _save_browser_draft(
                         session_storage=session_storage,
                         selected_pdf=selected_pdf,
                         page_num=page_num,
                         highlighted_text=highlighted_text,
                         follow_up=follow_up,
-                        explanation=explanation,
+                        view_mode=active_mode,
+                        ai_bundle=bundle,
                     )
 
-        if "last_explanation" in st.session_state:
+        if "last_ai_bundle" in st.session_state:
+            bundle = st.session_state["last_ai_bundle"]
             st.markdown("---")
-            st.markdown(st.session_state["last_explanation"])
+
+            view_mode = st.radio(
+                "Switch Output View (instant — no extra AI call):",
+                ["🔤 Explain", "💻 Show Code", "⌨️ Show Command"],
+                horizontal=True,
+                key="doc_view_mode",
+            )
+
+            if view_mode == "🔤 Explain":
+                st.markdown(bundle.get("explanation", ""))
+            elif view_mode == "💻 Show Code":
+                st.code(
+                    bundle.get("code", ""),
+                    language=bundle.get("code_lang", "python"),
+                )
+            elif view_mode == "⌨️ Show Command":
+                st.code(bundle.get("command", ""), language="bash")
+                if bundle.get("command_notes"):
+                    st.markdown("**Command Breakdown:**")
+                    st.markdown(bundle["command_notes"])
 
 
 def render_doc_viewer():
