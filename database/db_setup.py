@@ -104,8 +104,15 @@ def get_connection():
     return conn
 
 
+def _ensure_column(conn, table_name: str, column_name: str, column_def: str):
+    """Safely add a column to an existing STRICT table if it does not already exist."""
+    existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in existing_cols:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def};")
+
+
 def init_db():
-    """Initialize all core database tables if they do not exist."""
+    """Initialize all core database tables and apply safe schema migrations."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -134,7 +141,10 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename TEXT NOT NULL UNIQUE,
                 notes TEXT,
-                uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+                total_pages INTEGER NOT NULL DEFAULT 1,
+                pages_json TEXT NOT NULL DEFAULT '[]',
+                uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT
             ) STRICT;
         """)
         conn.execute("""
@@ -143,6 +153,13 @@ def init_db():
                 filename TEXT NOT NULL,
                 analysis TEXT NOT NULL,
                 starter_code TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT
             ) STRICT;
         """)
+
+        # Migrate existing Turso/SQLite tables safely if created prior to 7-day retention
+        _ensure_column(conn, "documents", "total_pages", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "documents", "pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "documents", "expires_at", "TEXT")
+        _ensure_column(conn, "screenshots", "expires_at", "TEXT")

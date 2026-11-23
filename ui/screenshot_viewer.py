@@ -2,7 +2,12 @@ import os
 import re
 import streamlit as st
 from core.screenshot_analyzer import save_uploaded_screenshot, analyze_screenshot
-from database.screenshots_db import save_screenshot_record, get_all_screenshots
+from core.cheat_sheet_exporter import record_study_note, render_cheat_sheet_download
+from database.screenshots_db import (
+    save_screenshot_record,
+    get_all_screenshots,
+    delete_screenshot_record,
+)
 from ui.code_panel import render_code_panel
 
 CODE_BLOCK_PATTERN = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
@@ -89,15 +94,28 @@ def _render_active_analyzer(saved_path: str):
 
                 result = analyze_screenshot(saved_path, f"{focus_prompt}{mode_hint}".strip())
                 extracted_blocks = _extract_code_blocks(result)
+                first_lang = extracted_blocks[0][0] if extracted_blocks else "python"
                 first_code = extracted_blocks[0][1] if extracted_blocks else ""
+                analysis_prose = _strip_code_blocks(result)
 
+                filename = os.path.basename(saved_path)
                 save_screenshot_record(
-                    filename=os.path.basename(saved_path),
+                    filename=filename,
                     analysis=result,
                     starter_code=first_code,
                 )
                 _cached_get_all_screenshots.clear()
                 st.session_state["last_vision_result"] = result
+
+                # Automatically record visual analysis + extracted code to the offline cheat-sheet
+                note_title = focus_prompt.strip().splitlines()[0][:65] if focus_prompt.strip() else filename
+                record_study_note(
+                    source=f"Screenshot Analyzer ({filename})",
+                    title=note_title,
+                    explanation=analysis_prose,
+                    code=first_code,
+                    code_lang=first_lang,
+                )
 
     if "last_vision_result" in st.session_state:
         vision_output = st.session_state["last_vision_result"]
@@ -110,14 +128,21 @@ def _render_active_analyzer(saved_path: str):
             key_prefix="vision_snippet",
         )
 
-        if st.button("⚡ Send Full Analysis Context to Try-It Sandbox"):
+        extracted_blocks = _extract_code_blocks(vision_output)
+        if st.button("⚡ Load into Try-It Sandbox", use_container_width=True):
             st.session_state["last_highlighted_snippet"] = vision_output
-            st.info("Context copied! Open **⚡ Interactive Try-It Sandbox** in the sidebar to generate and test code.")
+            if extracted_blocks:
+                st.session_state["sandbox_prefill_lang"] = extracted_blocks[0][0]
+                st.session_state["sandbox_prefill_code"] = extracted_blocks[0][1]
+            st.info("Code & context loaded! Open **⚡ Interactive Try-It Sandbox** in the sidebar to run or modify it.")
 
 
 def render_screenshot_viewer():
     st.header("🖼️ Screenshot & Architecture Analyzer")
-    st.caption("Upload UI mockups, system architecture diagrams, or error screenshots to extract insights and starter code.")
+    st.caption(
+        "Upload UI mockups, system architecture diagrams, or error screenshots to extract insights and starter code. "
+        "Saved analyses auto-expire after **7 days** or can be deleted anytime."
+    )
 
     uploaded_img = st.file_uploader(
         "Upload a screenshot or diagram (PNG, JPG, WEBP)",
@@ -127,6 +152,9 @@ def render_screenshot_viewer():
     if uploaded_img is not None:
         saved_path = save_uploaded_screenshot(uploaded_img)
         _render_active_analyzer(saved_path)
+
+    st.markdown("---")
+    render_cheat_sheet_download(location_key="screenshot_viewer")
 
     st.markdown("---")
     st.subheader("🗂️ Past Visual Analyses")
@@ -141,9 +169,21 @@ def render_screenshot_viewer():
             key="vision_history_mode",
         )
         for item in history:
-            with st.expander(f"🖼️ {item['filename']} ({item['created_at']})"):
+            expiry_label = f" • Expires: {item['expires_at']}" if item.get("expires_at") else " • 7-day TTL"
+            with st.expander(f"🖼️ {item['filename']} ({item['created_at']}{expiry_label})"):
                 _render_vision_output(
                     vision_output=item["analysis"],
                     view_mode=history_view,
                     key_prefix=f"history_{item['id']}",
                 )
+
+                col_del, _ = st.columns([1.2, 3.8])
+                with col_del:
+                    if st.button("🗑️ Delete Analysis", key=f"del_shot_{item['id']}", use_container_width=True):
+                        delete_screenshot_record(
+                            screenshot_id=item["id"],
+                            filename=item.get("filename", ""),
+                        )
+                        _cached_get_all_screenshots.clear()
+                        st.toast(f"Deleted {item['filename']}")
+                        st.rerun()

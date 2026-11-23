@@ -3,8 +3,16 @@ import re
 import json
 import streamlit as st
 from streamlit_session_browser_storage import SessionStorage
-from core.pdf_processor import save_uploaded_pdf, list_saved_pdfs, extract_pdf_pages, UPLOAD_DIR
+from core.pdf_processor import (
+    save_uploaded_pdf,
+    list_saved_pdfs,
+    get_pdf_pages,
+    delete_saved_pdf,
+    UPLOAD_DIR,
+)
 from core.ai_client import AIClient
+from core.cheat_sheet_exporter import record_study_note, render_cheat_sheet_download
+from database.error_bank_db import add_error
 
 TRANSLATOR_SYSTEM_PROMPT = """
 You are an expert software engineering and cybersecurity tutor.
@@ -19,22 +27,51 @@ When given a highlighted snippet from a technical manual, networking guide, or c
 }
 """
 
+QUIZ_SYSTEM_PROMPT = """
+You are an expert computer science and cybersecurity examiner.
+Generate 4 active-recall questions from the provided study material (mix conceptual multiple-choice and practical CLI/code fill-in-the-blank questions).
+Return ONLY strictly valid JSON (no markdown fences outside the JSON, no extra commentary):
+
+{
+  "questions": [
+    {
+      "id": "q1",
+      "type": "mcq",
+      "question": "Clear technical question testing deep understanding?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "answer": "Option B",
+      "explanation": "Concise explanation of why Option B is correct and why the others fail."
+    },
+    {
+      "id": "q2",
+      "type": "cli",
+      "question": "Complete the command to show only open ports on 192.168.1.1: nmap _____ 192.168.1.1",
+      "options": ["--open", "-sU", "-sn", "--closed"],
+      "answer": "--open",
+      "explanation": "The --open flag instructs Nmap to display only open (or possibly open) ports."
+    }
+  ]
+}
+"""
+
 DRAFT_KEY = "doc_viewer_temp_draft"
 
 
-@st.cache_data(show_spinner=False)
-def _cached_extract_pages(pdf_path: str, file_mtime: float):
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_get_pdf_pages(filename: str, disk_mtime: float, has_turso_marker: bool):
     """Cache parsed PDF pages in RAM so page flips and reruns are instant."""
-    return extract_pdf_pages(pdf_path)
+    return get_pdf_pages(filename)
+
+
+def _strip_json_fences(raw_response: str) -> str:
+    cleaned = raw_response.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    return re.sub(r"\s*```$", "", cleaned)
 
 
 def _parse_ai_bundle(raw_response: str) -> dict:
     """Safely extract JSON fields from the AI response with graceful fallback."""
-    cleaned = raw_response.strip()
-    # Strip optional ```json ... ``` wrapper if the model includes one
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-
+    cleaned = _strip_json_fences(raw_response)
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict) and any(k in data for k in ("explanation", "code", "command")):
@@ -48,7 +85,6 @@ def _parse_ai_bundle(raw_response: str) -> dict:
     except Exception:
         pass
 
-    # Fallback if rate-limit notice or plain markdown was returned
     return {
         "explanation": raw_response,
         "code_lang": "python",
@@ -58,8 +94,52 @@ def _parse_ai_bundle(raw_response: str) -> dict:
     }
 
 
+def _parse_quiz_bundle(raw_response: str) -> tuple[list[dict], str]:
+    """Parse generated quiz questions or return an error/rate-limit message."""
+    cleaned = _strip_json_fences(raw_response)
+    try:
+        data = json.loads(cleaned)
+        questions = data.get("questions", []) if isinstance(data, dict) else []
+        valid_questions = [
+            q for q in questions
+            if isinstance(q, dict) and q.get("question") and q.get("options") and q.get("answer")
+        ]
+        if valid_questions:
+            return valid_questions, ""
+    except Exception:
+        pass
+    return [], raw_response
+
+
+def _log_missed_question_to_error_bank(
+    source_doc: str,
+    page_num: int,
+    question_obj: dict,
+    user_answer: str,
+):
+    """Save a missed active-recall quiz question into error_bank (auto-expires after 15 days)."""
+    category = "CLI / Security" if question_obj.get("type") == "cli" else "Concept Recall"
+    error_title = f"[{source_doc} p.{page_num}] {question_obj['question'][:90]}"
+    broken_code = f"Question:\n{question_obj['question']}\n\nSelected Answer:\n{user_answer}"
+    error_message = f"Incorrect Quiz Answer: chose '{user_answer}' instead of '{question_obj['answer']}'"
+    ai_diagnosis = question_obj.get("explanation", "Review this concept in your study manual.")
+    fixed_code = question_obj["answer"]
+
+    try:
+        add_error(
+            language=category,
+            error_title=error_title,
+            broken_code=broken_code,
+            error_message=error_message,
+            ai_diagnosis=ai_diagnosis,
+            fixed_code=fixed_code,
+        )
+    except Exception as exc:
+        st.toast(f"Could not save missed question to Error Bank: {exc}")
+
+
 def _restore_browser_draft(session_storage: SessionStorage):
-    """Restore temporary highlight, toggle state, and AI outputs after a reconnect."""
+    """Restore temporary highlight, toggle state, quiz, and AI outputs after a reconnect."""
     if st.session_state.get("_doc_draft_restored"):
         return
 
@@ -75,6 +155,10 @@ def _restore_browser_draft(session_storage: SessionStorage):
                 st.session_state.setdefault("doc_view_mode", draft.get("view_mode", "🔤 Explain"))
                 if draft.get("ai_bundle"):
                     st.session_state.setdefault("last_ai_bundle", draft["ai_bundle"])
+                if draft.get("quiz_questions"):
+                    st.session_state.setdefault("active_page_quiz", draft["quiz_questions"])
+                if draft.get("study_session_notes"):
+                    st.session_state.setdefault("study_session_notes", draft["study_session_notes"])
                 st.session_state["_doc_draft_restored"] = True
         except Exception:
             pass
@@ -87,9 +171,10 @@ def _save_browser_draft(
     highlighted_text: str,
     follow_up: str,
     view_mode: str,
-    ai_bundle: dict,
+    ai_bundle: dict | None,
+    quiz_questions: list[dict] | None = None,
 ):
-    """Store active reading state in browser tab memory (auto-clears when tab closes)."""
+    """Store active reading, quiz, and cheat-sheet state in browser tab memory."""
     payload = {
         "selected_pdf": selected_pdf,
         "page_num": page_num,
@@ -97,8 +182,27 @@ def _save_browser_draft(
         "follow_up": follow_up,
         "view_mode": view_mode,
         "ai_bundle": ai_bundle,
+        "quiz_questions": quiz_questions or [],
+        "study_session_notes": st.session_state.get("study_session_notes", []),
     }
     session_storage.setItem(DRAFT_KEY, json.dumps(payload))
+
+
+def _clear_doc_viewer_state(session_storage: SessionStorage):
+    for k in (
+        "doc_highlight_input",
+        "doc_followup_input",
+        "last_ai_bundle",
+        "doc_view_mode",
+        "active_page_quiz",
+        "quiz_graded_results",
+        "_doc_draft_restored",
+    ):
+        st.session_state.pop(k, None)
+    try:
+        session_storage.deleteItem(DRAFT_KEY)
+    except Exception:
+        pass
 
 
 @st.fragment
@@ -106,16 +210,29 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
     default_pdf = st.session_state.get("doc_selected_pdf", "")
     default_index = saved_pdfs.index(default_pdf) if default_pdf in saved_pdfs else 0
 
-    selected_pdf = st.selectbox(
-        "Select a document from your library:",
-        saved_pdfs,
-        index=default_index,
-        key="doc_selected_pdf",
-    )
-    pdf_path = os.path.join(UPLOAD_DIR, selected_pdf)
+    col_select, col_delete = st.columns([4, 1.2])
+    with col_select:
+        selected_pdf = st.selectbox(
+            "Select a document from your library:",
+            saved_pdfs,
+            index=default_index,
+            key="doc_selected_pdf",
+        )
+    with col_delete:
+        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button("🗑️ Delete PDF", use_container_width=True, help="Remove this PDF from Turso and local storage"):
+            delete_saved_pdf(selected_pdf)
+            _cached_get_pdf_pages.clear()
+            st.session_state.pop("doc_selected_pdf", None)
+            st.session_state.pop("doc_page_num", None)
+            _clear_doc_viewer_state(session_storage)
+            st.toast(f"Deleted {selected_pdf}")
+            st.rerun()
+
+    pdf_path = os.path.join(UPLOAD_DIR, os.path.basename(selected_pdf))
     file_mtime = os.path.getmtime(pdf_path) if os.path.exists(pdf_path) else 0.0
 
-    pages = _cached_extract_pages(pdf_path, file_mtime)
+    pages = _cached_get_pdf_pages(selected_pdf, file_mtime, True)
     total_pages = max(1, len(pages))
 
     saved_page = int(st.session_state.get("doc_page_num", 1))
@@ -133,10 +250,10 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
             step=1,
             key="doc_page_num",
         )
-        st.caption(f"Showing page {page_num} of {total_pages}")
+        st.caption(f"Showing page {page_num} of {total_pages} • Auto-expires after 7 days")
         current_text = pages[page_num - 1]["text"] if pages else ""
         st.text_area(
-            "Extracted Page Text (Copy any section to translate or explain):",
+            "Extracted Page Text (Copy any section to translate, explain, or quiz):",
             value=current_text,
             height=440,
         )
@@ -146,22 +263,14 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
         with header_col:
             st.subheader("💡 Highlight → Code / Command")
         with clear_col:
-            if st.button("🧹 Clear", help="Clear temporary highlight and output", use_container_width=True):
-                for k in (
-                    "doc_highlight_input",
-                    "doc_followup_input",
-                    "last_ai_bundle",
-                    "doc_view_mode",
-                    "_doc_draft_restored",
-                ):
-                    st.session_state.pop(k, None)
-                session_storage.deleteItem(DRAFT_KEY)
+            if st.button("🧹 Clear", help="Clear temporary highlight, quiz, and output", use_container_width=True):
+                _clear_doc_viewer_state(session_storage)
                 st.rerun(scope="fragment")
 
         highlighted_text = st.text_area(
             "Paste plain-English concept, networking step, or syntax:",
-            height=140,
-            placeholder="Paste text from the page reader on the left...",
+            height=130,
+            placeholder="Paste text from the page reader on the left (or leave empty to quiz the whole page)...",
             key="doc_highlight_input",
         )
         follow_up = st.text_input(
@@ -170,31 +279,173 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
             key="doc_followup_input",
         )
 
-        if st.button("✨ Translate & Explain Concept", type="primary", use_container_width=True):
-            if not highlighted_text.strip():
-                st.warning("Paste a snippet first so the AI knows what to translate.")
-            else:
-                with st.spinner("Generating Explanation, Code & Command..."):
-                    ai = AIClient()
-                    prompt = f"Document: {selected_pdf} (Page {page_num})\n\nHighlighted Snippet:\n{highlighted_text}"
-                    if follow_up.strip():
-                        prompt += f"\n\nSpecific Question / Preference: {follow_up}"
+        btn_translate, btn_quiz = st.columns(2)
 
-                    raw_response = ai.ask(prompt, system_instruction=TRANSLATOR_SYSTEM_PROMPT)
-                    bundle = _parse_ai_bundle(raw_response)
-                    st.session_state["last_ai_bundle"] = bundle
+        with btn_translate:
+            if st.button("✨ Translate & Explain", type="primary", use_container_width=True):
+                if not highlighted_text.strip():
+                    st.warning("Paste a snippet first so the AI knows what to translate.")
+                else:
+                    with st.spinner("Generating Explanation, Code & Command..."):
+                        ai = AIClient()
+                        prompt = f"Document: {selected_pdf} (Page {page_num})\n\nHighlighted Snippet:\n{highlighted_text}"
+                        if follow_up.strip():
+                            prompt += f"\n\nSpecific Question / Preference: {follow_up}"
 
-                    active_mode = st.session_state.get("doc_view_mode", "🔤 Explain")
+                        raw_response = ai.ask(prompt, system_instruction=TRANSLATOR_SYSTEM_PROMPT)
+                        bundle = _parse_ai_bundle(raw_response)
+                        st.session_state["last_ai_bundle"] = bundle
+
+                        # Record into session cheat-sheet automatically
+                        snippet_preview = highlighted_text.strip().splitlines()[0][:65]
+                        record_study_note(
+                            source=f"{selected_pdf} (Page {page_num})",
+                            title=snippet_preview,
+                            explanation=bundle.get("explanation", ""),
+                            code=bundle.get("code", ""),
+                            code_lang=bundle.get("code_lang", "python"),
+                            command=bundle.get("command", ""),
+                            command_notes=bundle.get("command_notes", ""),
+                        )
+
+                        _save_browser_draft(
+                            session_storage=session_storage,
+                            selected_pdf=selected_pdf,
+                            page_num=page_num,
+                            highlighted_text=highlighted_text,
+                            follow_up=follow_up,
+                            view_mode=st.session_state.get("doc_view_mode", "🔤 Explain"),
+                            ai_bundle=bundle,
+                            quiz_questions=st.session_state.get("active_page_quiz", []),
+                        )
+
+        with btn_quiz:
+            if st.button("📝 Quiz Me on This Page", use_container_width=True):
+                source_material = highlighted_text.strip() or current_text.strip()
+                if not source_material:
+                    st.warning("This page has no readable text to generate a quiz from.")
+                else:
+                    with st.spinner("Generating 4 active-recall questions..."):
+                        ai = AIClient()
+                        quiz_prompt = (
+                            f"Document: {selected_pdf} (Page {page_num})\n\n"
+                            f"Study Material:\n{source_material[:3500]}"
+                        )
+                        raw_quiz = ai.ask(quiz_prompt, system_instruction=QUIZ_SYSTEM_PROMPT)
+                        questions, err_msg = _parse_quiz_bundle(raw_quiz)
+
+                        if err_msg:
+                            st.warning(err_msg)
+                        else:
+                            st.session_state["active_page_quiz"] = questions
+                            st.session_state.pop("quiz_graded_results", None)
+                            _save_browser_draft(
+                                session_storage=session_storage,
+                                selected_pdf=selected_pdf,
+                                page_num=page_num,
+                                highlighted_text=highlighted_text,
+                                follow_up=follow_up,
+                                view_mode=st.session_state.get("doc_view_mode", "🔤 Explain"),
+                                ai_bundle=st.session_state.get("last_ai_bundle"),
+                                quiz_questions=questions,
+                            )
+
+        # --- Section A: Active Recall Quiz (Local Grading + Auto Error Bank Logging) ---
+        if st.session_state.get("active_page_quiz"):
+            st.markdown("---")
+            st.markdown("### 🧠 Active Recall Quiz")
+            st.caption("Missed questions auto-log to your **Personal Error Bank** (auto-deleted after 15 days).")
+
+            questions = st.session_state["active_page_quiz"]
+            with st.form(key=f"quiz_form_{selected_pdf}_{page_num}"):
+                user_choices = {}
+                for idx, q in enumerate(questions, start=1):
+                    badge = "⌨️ CLI / Code" if q.get("type") == "cli" else "📘 Concept"
+                    st.markdown(f"**Q{idx} ({badge}):** {q['question']}")
+                    user_choices[q["id"]] = st.radio(
+                        f"Select answer for Q{idx}:",
+                        q["options"],
+                        index=None,
+                        key=f"quiz_ans_{selected_pdf}_{page_num}_{q['id']}",
+                        label_visibility="collapsed",
+                    )
+
+                submitted = st.form_submit_button("✅ Grade Quiz (Instant)", type="primary", use_container_width=True)
+
+            if submitted:
+                if any(ans is None for ans in user_choices.values()):
+                    st.warning("Please answer all questions before grading.")
+                else:
+                    score = 0
+                    results = []
+                    for q in questions:
+                        chosen = user_choices[q["id"]]
+                        correct = q["answer"]
+                        is_right = chosen.strip() == correct.strip()
+                        if is_right:
+                            score += 1
+                        else:
+                            _log_missed_question_to_error_bank(
+                                source_doc=selected_pdf,
+                                page_num=page_num,
+                                question_obj=q,
+                                user_answer=chosen,
+                            )
+                        results.append({
+                            "question": q["question"],
+                            "chosen": chosen,
+                            "correct": correct,
+                            "is_right": is_right,
+                            "explanation": q.get("explanation", ""),
+                        })
+                    st.session_state["quiz_graded_results"] = {
+                        "score": score,
+                        "total": len(questions),
+                        "details": results,
+                    }
+
+                    quiz_summary_lines = [
+                        f"- **{'✅' if r['is_right'] else '❌'} {r['question']}** → Answer: `{r['correct']}` ({r['explanation']})"
+                        for r in results
+                    ]
+                    record_study_note(
+                        source=f"Active Recall Quiz • {selected_pdf} (Page {page_num})",
+                        title=f"Quiz Review ({score}/{len(questions)} Score)",
+                        explanation="\n".join(quiz_summary_lines),
+                    )
                     _save_browser_draft(
                         session_storage=session_storage,
                         selected_pdf=selected_pdf,
                         page_num=page_num,
                         highlighted_text=highlighted_text,
                         follow_up=follow_up,
-                        view_mode=active_mode,
-                        ai_bundle=bundle,
+                        view_mode=st.session_state.get("doc_view_mode", "🔤 Explain"),
+                        ai_bundle=st.session_state.get("last_ai_bundle"),
+                        quiz_questions=questions,
                     )
 
+            if "quiz_graded_results" in st.session_state:
+                graded = st.session_state["quiz_graded_results"]
+                score, total = graded["score"], graded["total"]
+                if score == total:
+                    st.success(f"🎉 Perfect Score: **{score}/{total}**! Zero errors logged.")
+                else:
+                    missed_count = total - score
+                    st.warning(
+                        f"Score: **{score}/{total}** — Logged **{missed_count}** missed concept(s) "
+                        f"to your **Personal Error Bank** (kept for 15 days)."
+                    )
+
+                for idx, item in enumerate(graded["details"], start=1):
+                    if item["is_right"]:
+                        st.markdown(f"✅ **Q{idx}:** Correct (`{item['correct']}`) — {item['explanation']}")
+                    else:
+                        st.markdown(
+                            f"❌ **Q{idx}:** You chose `{item['chosen']}` | Correct: **`{item['correct']}`**\n"
+                            f"> 💡 {item['explanation']}"
+                        )
+
+        # --- Section B: Explain / Show Code / Show Command Output ---
         if "last_ai_bundle" in st.session_state:
             bundle = st.session_state["last_ai_bundle"]
             st.markdown("---")
@@ -209,19 +460,33 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
             if view_mode == "🔤 Explain":
                 st.markdown(bundle.get("explanation", ""))
             elif view_mode == "💻 Show Code":
-                st.code(
-                    bundle.get("code", ""),
-                    language=bundle.get("code_lang", "python"),
-                )
+                code_snippet = bundle.get("code", "")
+                code_lang = bundle.get("code_lang", "python")
+                st.code(code_snippet, language=code_lang)
+
+                if st.button("⚡ Load into Try-It Sandbox", use_container_width=True, key="btn_send_doc_code_sandbox"):
+                    st.session_state["last_highlighted_snippet"] = (
+                        f"Language: {code_lang}\n"
+                        f"Source: {selected_pdf} (Page {page_num})\n\n"
+                        f"```{code_lang}\n{code_snippet}\n```"
+                    )
+                    st.session_state["sandbox_prefill_code"] = code_snippet
+                    st.session_state["sandbox_prefill_lang"] = code_lang
+                    st.info("Code loaded! Open **⚡ Interactive Try-It Sandbox** in the sidebar to run or modify it.")
             elif view_mode == "⌨️ Show Command":
                 st.code(bundle.get("command", ""), language="bash")
                 if bundle.get("command_notes"):
                     st.markdown("**Command Breakdown:**")
                     st.markdown(bundle["command_notes"])
 
+        # --- Section C: 1-Click Offline Cheat-Sheet Export (Zero API Cost) ---
+        st.markdown("---")
+        render_cheat_sheet_download(location_key="doc_viewer")
+
 
 def render_doc_viewer():
     st.header("📖 Document Library & Highlight Explainer")
+    st.caption("Uploaded PDFs are persisted in Turso across reboots, auto-expire after **7 days**, or can be deleted anytime.")
 
     session_storage = SessionStorage()
     _restore_browser_draft(session_storage)
@@ -230,7 +495,8 @@ def render_doc_viewer():
     uploaded_file = st.file_uploader("Upload a PDF manual or documentation", type=["pdf"])
     if uploaded_file is not None:
         saved_path = save_uploaded_pdf(uploaded_file)
-        st.success(f"Saved **{os.path.basename(saved_path)}** to your library!")
+        _cached_get_pdf_pages.clear()
+        st.success(f"Saved **{os.path.basename(saved_path)}** to your library (7-day retention)!")
 
     saved_pdfs = list_saved_pdfs()
     if not saved_pdfs:

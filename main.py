@@ -1,6 +1,9 @@
 import os
 import streamlit as st
 from database.db_setup import init_db
+from database.screenshots_db import purge_expired_screenshots
+from core.pdf_processor import cleanup_expired_pdfs
+from core.cheat_sheet_exporter import render_cheat_sheet_download
 from ui.auth_view import render_auth_view
 from ui.dashboard import render_dashboard
 from ui.doc_viewer import render_doc_viewer
@@ -13,7 +16,7 @@ st.set_page_config(
     page_title="Smart Document Learning System",
     page_icon="📚",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
@@ -27,8 +30,10 @@ def get_css_content(file_path: str = os.path.join("assets", "styles.css")) -> st
 
 @st.cache_resource
 def bootstrap_database() -> bool:
-    """Initialize Turso/SQLite tables once per server startup instead of every rerun."""
+    """Initialize Turso/SQLite tables and run 7-day retention cleanup once per startup."""
     init_db()
+    cleanup_expired_pdfs()
+    purge_expired_screenshots()
     return True
 
 
@@ -63,9 +68,12 @@ with st.sidebar:
             "💬 AI Discussion Room",
             "⚡ Interactive Try-It Sandbox",
             "📉 Personal Error Bank",
-            "🖼️ Screenshot Analysis"
-        ]
+            "🖼️ Screenshot Analysis",
+        ],
     )
+
+    st.markdown("---")
+    render_cheat_sheet_download(location_key="sidebar")
 
     st.markdown("---")
     if st.button("🚪 Logout", use_container_width=True):
