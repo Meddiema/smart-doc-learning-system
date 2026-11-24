@@ -2,7 +2,10 @@ import os
 import time
 from pypdf import PdfReader
 from database.documents_db import (
+    DOCUMENT_RETENTION_DAYS,
     save_document_to_turso,
+    renew_document_retention,
+    get_document_days_remaining,
     list_turso_documents,
     get_turso_document_pages,
     delete_turso_document,
@@ -10,7 +13,7 @@ from database.documents_db import (
 )
 
 UPLOAD_DIR = os.path.join("data", "uploaded_docs")
-SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60
+SEVEN_DAYS_SECONDS = DOCUMENT_RETENTION_DAYS * 24 * 60 * 60
 
 
 def extract_pdf_pages(file_path: str) -> list[dict]:
@@ -87,6 +90,50 @@ def list_saved_pdfs() -> list[str]:
     turso_pdfs = {doc["filename"] for doc in list_turso_documents() if doc.get("filename")}
 
     return sorted(disk_pdfs | turso_pdfs)
+
+
+def get_pdf_retention_info(filename: str, upload_dir: str = UPLOAD_DIR) -> dict:
+    """Return countdown badge and expiry metadata for a saved PDF."""
+    safe_name = os.path.basename(filename)
+    for doc in list_turso_documents():
+        if doc.get("filename") == safe_name:
+            return get_document_days_remaining(
+                expires_at=doc.get("expires_at"),
+                uploaded_at=doc.get("uploaded_at"),
+                retention_days=DOCUMENT_RETENTION_DAYS,
+            )
+
+    local_path = os.path.join(upload_dir, safe_name)
+    if os.path.exists(local_path) and os.path.isfile(local_path):
+        now = time.time()
+        age = max(0.0, now - os.path.getmtime(local_path))
+        remaining_seconds = max(0.0, SEVEN_DAYS_SECONDS - age)
+        days_left = int((remaining_seconds + 86399) // 86400) if remaining_seconds > 0 else 0
+        return {
+            "days_left": days_left,
+            "hours_left": int((remaining_seconds + 3599) // 3600) if remaining_seconds > 0 else 0,
+            "expires_label": "Local 7d window",
+            "badge": f"⏳ {days_left}d left" if days_left > 0 else "⚠️ Expiring soon",
+            "is_expiring_soon": 0 < remaining_seconds <= 2 * 86400,
+        }
+
+    return get_document_days_remaining(expires_at=None, retention_days=DOCUMENT_RETENTION_DAYS)
+
+
+def renew_saved_pdf(filename: str, upload_dir: str = UPLOAD_DIR) -> str:
+    """Extend a PDF's retention window by 7 days in Turso and refresh local file mtime."""
+    safe_name = os.path.basename(filename)
+    new_expiry = renew_document_retention(safe_name, retention_days=DOCUMENT_RETENTION_DAYS)
+
+    local_path = os.path.join(upload_dir, safe_name)
+    if os.path.exists(local_path) and os.path.isfile(local_path):
+        try:
+            now = time.time()
+            os.utime(local_path, (now, now))
+        except Exception:
+            pass
+
+    return new_expiry
 
 
 def get_pdf_pages(filename: str) -> list[dict]:

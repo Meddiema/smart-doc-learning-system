@@ -8,6 +8,8 @@ from core.pdf_processor import (
     list_saved_pdfs,
     get_pdf_pages,
     delete_saved_pdf,
+    get_pdf_retention_info,
+    renew_saved_pdf,
     UPLOAD_DIR,
 )
 from core.ai_client import AIClient
@@ -61,6 +63,34 @@ DRAFT_KEY = "doc_viewer_temp_draft"
 def _cached_get_pdf_pages(filename: str, disk_mtime: float, has_turso_marker: bool):
     """Cache parsed PDF pages in RAM so page flips and reruns are instant."""
     return get_pdf_pages(filename)
+
+
+def _search_pdf_pages(pages: list[dict], query: str) -> list[dict]:
+    """Scan already-cached PDF pages in Python (zero API cost) and return matching page hits."""
+    clean_query = (query or "").strip()
+    if len(clean_query) < 2:
+        return []
+
+    pattern = re.compile(re.escape(clean_query), re.IGNORECASE)
+    matches = []
+    for idx, page in enumerate(pages, start=1):
+        text = page.get("text", "")
+        found = list(pattern.finditer(text))
+        if found:
+            first_start = found[0].start()
+            snippet_start = max(0, first_start - 45)
+            snippet_end = min(len(text), first_start + len(clean_query) + 75)
+            snippet = re.sub(r"\s+", " ", text[snippet_start:snippet_end]).strip()
+            if snippet_start > 0:
+                snippet = f"...{snippet}"
+            if snippet_end < len(text):
+                snippet = f"{snippet}..."
+            matches.append({
+                "page_num": page.get("page_num", idx),
+                "count": len(found),
+                "snippet": snippet,
+            })
+    return matches
 
 
 def _strip_json_fences(raw_response: str) -> str:
@@ -192,6 +222,7 @@ def _clear_doc_viewer_state(session_storage: SessionStorage):
     for k in (
         "doc_highlight_input",
         "doc_followup_input",
+        "doc_search_query",
         "last_ai_bundle",
         "doc_view_mode",
         "active_page_quiz",
@@ -210,7 +241,7 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
     default_pdf = st.session_state.get("doc_selected_pdf", "")
     default_index = saved_pdfs.index(default_pdf) if default_pdf in saved_pdfs else 0
 
-    col_select, col_delete = st.columns([4, 1.2])
+    col_select, col_renew, col_delete = st.columns([3.4, 1.1, 1.1])
     with col_select:
         selected_pdf = st.selectbox(
             "Select a document from your library:",
@@ -218,6 +249,20 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
             index=default_index,
             key="doc_selected_pdf",
         )
+
+    retention = get_pdf_retention_info(selected_pdf)
+
+    with col_renew:
+        st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button(
+            "🔄 Renew 7d",
+            use_container_width=True,
+            help=f"Extend retention by 7 days (currently expires {retention['expires_label']})",
+        ):
+            renew_saved_pdf(selected_pdf)
+            st.toast(f"Extended {selected_pdf} by 7 days!")
+            st.rerun(scope="fragment")
+
     with col_delete:
         st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
         if st.button("🗑️ Delete PDF", use_container_width=True, help="Remove this PDF from Turso and local storage"):
@@ -242,6 +287,58 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
 
     with col_reader:
         st.subheader("📄 Page Reader")
+
+        # --- Zero-API-Cost Keyword Search & Jump-to-Page ---
+        search_col, clear_search_col = st.columns([4, 1])
+        with search_col:
+            search_query = st.text_input(
+                "Search inside PDF:",
+                placeholder="🔍 Jump to keyword (e.g., subnet, OAuth, Nmap, SQL)...",
+                key="doc_search_query",
+                label_visibility="collapsed",
+            )
+        with clear_search_col:
+            if search_query and st.button("✖", key="btn_clear_pdf_search", help="Clear search", use_container_width=True):
+                st.session_state["doc_search_query"] = ""
+                st.rerun(scope="fragment")
+
+        if search_query.strip():
+            hits = _search_pdf_pages(pages, search_query)
+            if not hits:
+                st.caption(f"No matches found for **{search_query.strip()}**.")
+            else:
+                total_occurrences = sum(h["count"] for h in hits)
+                st.caption(
+                    f"Found **{total_occurrences}** match(es) across **{len(hits)}** page(s) — click a page to jump:"
+                )
+                visible_hits = hits[:12]
+                cols_per_row = 6
+                for row_start in range(0, len(visible_hits), cols_per_row):
+                    row_hits = visible_hits[row_start : row_start + cols_per_row]
+                    btn_cols = st.columns(cols_per_row)
+                    for col_idx, hit in enumerate(row_hits):
+                        target_pg = hit["page_num"]
+                        is_current = target_pg == safe_page
+                        badge_label = f"p.{target_pg} ({hit['count']})"
+                        with btn_cols[col_idx]:
+                            if st.button(
+                                badge_label,
+                                key=f"jump_pg_{selected_pdf}_{target_pg}",
+                                type="primary" if is_current else "secondary",
+                                help=hit["snippet"],
+                                use_container_width=True,
+                            ):
+                                st.session_state["doc_page_num"] = target_pg
+                                st.rerun(scope="fragment")
+
+                if len(hits) > 12:
+                    remaining = ", ".join(f"p.{h['page_num']}" for h in hits[12:25])
+                    st.caption(f"More matches on: {remaining}{'...' if len(hits) > 25 else ''}")
+
+                active_hit = next((h for h in hits if h["page_num"] == safe_page), None)
+                if active_hit:
+                    st.info(f"**Page {safe_page} match preview:** {active_hit['snippet']}")
+
         page_num = st.number_input(
             "Page Number",
             min_value=1,
@@ -250,7 +347,9 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
             step=1,
             key="doc_page_num",
         )
-        st.caption(f"Showing page {page_num} of {total_pages} • Auto-expires after 7 days")
+        st.caption(
+            f"Showing page {page_num} of {total_pages} • {retention['badge']} (expires {retention['expires_label']})"
+        )
         current_text = pages[page_num - 1]["text"] if pages else ""
         st.text_area(
             "Extracted Page Text (Copy any section to translate, explain, or quiz):",

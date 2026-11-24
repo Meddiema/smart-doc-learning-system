@@ -1,22 +1,102 @@
+import math
+from datetime import datetime, timedelta, timezone
 from database.db_setup import get_connection
 
 ERROR_RETENTION_DAYS = 15
+UTC_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _parse_utc_timestamp(ts_str: str | None) -> datetime | None:
+    """Parse SQLite/ISO UTC timestamp strings safely into timezone-aware UTC datetimes."""
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    cleaned = ts_str.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(cleaned)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in (UTC_FMT, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(cleaned[:26], fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _has_expires_at_column(conn) -> bool:
+    """Check whether error_bank has an expires_at column."""
+    try:
+        cols = conn.execute("PRAGMA table_info(error_bank)").fetchall()
+        for col in cols:
+            name = col["name"] if isinstance(col, dict) or hasattr(col, "__getitem__") else col[1]
+            if name == "expires_at":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def get_error_retention_info(error_row: dict, retention_days: int = ERROR_RETENTION_DAYS) -> dict:
+    """Return countdown badge and expiry metadata for an Error Bank item."""
+    now_utc = datetime.now(timezone.utc)
+    exp_dt = _parse_utc_timestamp(error_row.get("expires_at"))
+
+    if exp_dt is None:
+        created_dt = _parse_utc_timestamp(error_row.get("created_at"))
+        if created_dt is not None:
+            exp_dt = created_dt + timedelta(days=retention_days)
+
+    if exp_dt is None:
+        return {
+            "days_left": retention_days,
+            "hours_left": retention_days * 24,
+            "expires_label": f"{retention_days}d TTL",
+            "badge": f"⏳ {retention_days}d left",
+            "is_expiring_soon": False,
+        }
+
+    remaining_secs = max(0.0, (exp_dt - now_utc).total_seconds())
+    hours_left = math.ceil(remaining_secs / 3600.0) if remaining_secs > 0 else 0
+    days_left = math.ceil(remaining_secs / 86400.0) if remaining_secs > 0 else 0
+
+    if remaining_secs <= 0:
+        badge = "⚠️ Expired"
+    elif hours_left < 24:
+        badge = f"⚠️ {hours_left}h left"
+    else:
+        badge = f"⏳ {days_left}d left"
+
+    return {
+        "days_left": days_left,
+        "hours_left": hours_left,
+        "expires_label": exp_dt.strftime("%b %d, %H:%M UTC"),
+        "badge": badge,
+        "is_expiring_soon": 0 < hours_left <= 72,
+    }
 
 
 def purge_expired_errors(days: int = ERROR_RETENTION_DAYS) -> int:
     """Automatically delete Personal Error Bank entries older than `days` (default 15 days)."""
     interval = f"-{int(days)} days"
+    now_iso = datetime.now(timezone.utc).strftime(UTC_FMT)
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM error_bank WHERE created_at IS NOT NULL AND datetime(created_at) < datetime('now', ?)",
-            (interval,),
-        ).fetchone()
+        has_exp = _has_expires_at_column(conn)
+        if has_exp:
+            where_clause = (
+                "(expires_at IS NOT NULL AND datetime(expires_at) < datetime(?)) "
+                "OR (expires_at IS NULL AND created_at IS NOT NULL AND datetime(created_at) < datetime(?, ?))"
+            )
+            params = (now_iso, now_iso, interval)
+        else:
+            where_clause = "created_at IS NOT NULL AND datetime(created_at) < datetime(?, ?)"
+            params = (now_iso, interval)
+
+        row = conn.execute(f"SELECT COUNT(*) FROM error_bank WHERE {where_clause}", params).fetchone()
         expired_count = row[0] if row else 0
         if expired_count > 0:
-            conn.execute(
-                "DELETE FROM error_bank WHERE created_at IS NOT NULL AND datetime(created_at) < datetime('now', ?)",
-                (interval,),
-            )
+            conn.execute(f"DELETE FROM error_bank WHERE {where_clause}", params)
         return expired_count
 
 
@@ -27,17 +107,64 @@ def add_error(
     error_message: str,
     ai_diagnosis: str,
     fixed_code: str = "",
+    retention_days: int = ERROR_RETENTION_DAYS,
 ) -> int:
-    purge_expired_errors()
+    purge_expired_errors(retention_days)
+    now_utc = datetime.now(timezone.utc)
+    created_iso = now_utc.strftime(UTC_FMT)
+    expires_iso = (now_utc + timedelta(days=retention_days)).strftime(UTC_FMT)
+
     with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO error_bank (language, error_title, broken_code, error_message, ai_diagnosis, fixed_code)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (language, error_title, broken_code, error_message, ai_diagnosis, fixed_code),
-        )
+        if _has_expires_at_column(conn):
+            cursor = conn.execute(
+                """
+                INSERT INTO error_bank (
+                    language, error_title, broken_code, error_message, ai_diagnosis, fixed_code, created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (language, error_title, broken_code, error_message, ai_diagnosis, fixed_code, created_iso, expires_iso),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO error_bank (
+                    language, error_title, broken_code, error_message, ai_diagnosis, fixed_code, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (language, error_title, broken_code, error_message, ai_diagnosis, fixed_code, created_iso),
+            )
         return cursor.lastrowid
+
+
+def renew_error_retention(error_id: int, retention_days: int = ERROR_RETENTION_DAYS) -> str:
+    """Extend an Error Bank entry's retention window by another 15 days from now (UTC)."""
+    purge_expired_errors(retention_days)
+    now_utc = datetime.now(timezone.utc)
+    created_iso = now_utc.strftime(UTC_FMT)
+    expires_iso = (now_utc + timedelta(days=retention_days)).strftime(UTC_FMT)
+
+    with get_connection() as conn:
+        if _has_expires_at_column(conn):
+            conn.execute(
+                """
+                UPDATE error_bank
+                SET created_at = ?, expires_at = ?
+                WHERE id = ?
+                """,
+                (created_iso, expires_iso, error_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE error_bank
+                SET created_at = ?
+                WHERE id = ?
+                """,
+                (created_iso, error_id),
+            )
+    return expires_iso
 
 
 def get_all_errors(search_query: str = "", only_unmastered: bool = False) -> list[dict]:

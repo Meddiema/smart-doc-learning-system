@@ -3,6 +3,7 @@ import re
 import streamlit as st
 from core.screenshot_analyzer import save_uploaded_screenshot, analyze_screenshot
 from core.cheat_sheet_exporter import record_study_note, render_cheat_sheet_download
+from database.documents_db import get_document_days_remaining
 from database.screenshots_db import (
     save_screenshot_record,
     get_all_screenshots,
@@ -169,8 +170,16 @@ def render_screenshot_viewer():
             key="vision_history_mode",
         )
         for item in history:
-            expiry_label = f" • Expires: {item['expires_at']}" if item.get("expires_at") else " • 7-day TTL"
-            with st.expander(f"🖼️ {item['filename']} ({item['created_at']}{expiry_label})"):
+            retention = get_document_days_remaining(
+                expires_at=item.get("expires_at"),
+                uploaded_at=item.get("created_at"),
+                retention_days=7,
+            )
+            expander_title = (
+                f"🖼️ {item['filename']} • {retention['badge']} "
+                f"(expires {retention['expires_label']})"
+            )
+            with st.expander(expander_title):
                 _render_vision_output(
                     vision_output=item["analysis"],
                     view_mode=history_view,
