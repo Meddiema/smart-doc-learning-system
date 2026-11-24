@@ -3,7 +3,6 @@ import streamlit as st
 from database.db_setup import init_db
 from database.screenshots_db import purge_expired_screenshots
 from core.pdf_processor import cleanup_expired_pdfs
-from core.cheat_sheet_exporter import render_cheat_sheet_download
 from ui.auth_view import render_auth_view
 from ui.dashboard import render_dashboard
 from ui.doc_viewer import render_doc_viewer
@@ -18,6 +17,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _render_sidebar_cheat_sheet(location_key: str = "sidebar"):
+    """Import and render cheat-sheet export safely after page config."""
+    try:
+        from core.cheat_sheet_exporter import render_cheat_sheet_download
+
+        render_cheat_sheet_download(location_key=location_key)
+    except Exception as exc:
+        st.caption(f"⚠️ Cheat-sheet exporter unavailable: {exc}")
 
 
 @st.cache_data
@@ -73,7 +82,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    render_cheat_sheet_download(location_key="sidebar")
+    _render_sidebar_cheat_sheet(location_key="sidebar")
 
     st.markdown("---")
     if st.button("🚪 Logout", use_container_width=True):
