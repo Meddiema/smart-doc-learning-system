@@ -8,6 +8,7 @@ from database.error_bank_db import (
     toggle_mastered,
     delete_error,
     get_error_stats,
+    renew_error_retention,
 )
 from ui.code_panel import render_code_panel
 
@@ -225,7 +226,7 @@ def render_error_bank_view():
                     else:
                         _render_solution_and_fix(err, key_suffix="browse")
 
-                    act1, act2 = st.columns(2)
+                    act1, act2, act3 = st.columns(3)
                     with act1:
                         new_state = not bool(err["mastered"])
                         btn_label = "Mark as Mastered ✅" if new_state else "Reopen for Practice 🔄"
@@ -233,6 +234,11 @@ def render_error_bank_view():
                             toggle_mastered(err["id"], new_state)
                             st.rerun()
                     with act2:
+                        if st.button("🔄 Renew 15d", key=f"renew_err_{err['id']}", use_container_width=True):
+                            renew_error_retention(err["id"])
+                            st.toast(f"Renewed '{err['error_title']}' for 15 days")
+                            st.rerun()
+                    with act3:
                         if st.button("Delete Entry 🗑️", key=f"del_{err['id']}", use_container_width=True):
                             delete_error(err["id"])
                             st.rerun()

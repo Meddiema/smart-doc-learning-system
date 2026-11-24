@@ -1,9 +1,10 @@
 import math
 from datetime import datetime, timedelta, timezone
-from database.db_setup import get_connection
+from database.db_setup import get_connection, init_db
 
 ERROR_RETENTION_DAYS = 15
 UTC_FMT = "%Y-%m-%d %H:%M:%S"
+_EXPIRES_COL_CACHE: bool | None = None
 
 
 def _parse_utc_timestamp(ts_str: str | None) -> datetime | None:
@@ -26,16 +27,18 @@ def _parse_utc_timestamp(ts_str: str | None) -> datetime | None:
 
 
 def _has_expires_at_column(conn) -> bool:
-    """Check whether error_bank has an expires_at column."""
+    """Check whether error_bank has an expires_at column (compatible with SQLite and Turso/libSQL)."""
+    global _EXPIRES_COL_CACHE
+    if _EXPIRES_COL_CACHE is not None:
+        return _EXPIRES_COL_CACHE
+
     try:
-        cols = conn.execute("PRAGMA table_info(error_bank)").fetchall()
-        for col in cols:
-            name = col["name"] if isinstance(col, dict) or hasattr(col, "__getitem__") else col[1]
-            if name == "expires_at":
-                return True
+        conn.execute("SELECT expires_at FROM error_bank LIMIT 1").fetchone()
+        _EXPIRES_COL_CACHE = True
     except Exception:
-        pass
-    return False
+        _EXPIRES_COL_CACHE = False
+
+    return _EXPIRES_COL_CACHE
 
 
 def get_error_retention_info(error_row: dict, retention_days: int = ERROR_RETENTION_DAYS) -> dict:
@@ -79,6 +82,7 @@ def get_error_retention_info(error_row: dict, retention_days: int = ERROR_RETENT
 
 def purge_expired_errors(days: int = ERROR_RETENTION_DAYS) -> int:
     """Automatically delete Personal Error Bank entries older than `days` (default 15 days)."""
+    init_db()
     interval = f"-{int(days)} days"
     now_iso = datetime.now(timezone.utc).strftime(UTC_FMT)
     with get_connection() as conn:
@@ -109,6 +113,7 @@ def add_error(
     fixed_code: str = "",
     retention_days: int = ERROR_RETENTION_DAYS,
 ) -> int:
+    init_db()
     purge_expired_errors(retention_days)
     now_utc = datetime.now(timezone.utc)
     created_iso = now_utc.strftime(UTC_FMT)
@@ -140,6 +145,7 @@ def add_error(
 
 def renew_error_retention(error_id: int, retention_days: int = ERROR_RETENTION_DAYS) -> str:
     """Extend an Error Bank entry's retention window by another 15 days from now (UTC)."""
+    init_db()
     purge_expired_errors(retention_days)
     now_utc = datetime.now(timezone.utc)
     created_iso = now_utc.strftime(UTC_FMT)
@@ -168,6 +174,7 @@ def renew_error_retention(error_id: int, retention_days: int = ERROR_RETENTION_D
 
 
 def get_all_errors(search_query: str = "", only_unmastered: bool = False) -> list[dict]:
+    init_db()
     purge_expired_errors()
     clauses = []
     params = []
@@ -189,6 +196,7 @@ def get_all_errors(search_query: str = "", only_unmastered: bool = False) -> lis
 
 
 def toggle_mastered(error_id: int, mastered: bool):
+    init_db()
     with get_connection() as conn:
         conn.execute(
             "UPDATE error_bank SET mastered = ? WHERE id = ?",
@@ -197,17 +205,20 @@ def toggle_mastered(error_id: int, mastered: bool):
 
 
 def delete_error(error_id: int):
+    init_db()
     with get_connection() as conn:
         conn.execute("DELETE FROM error_bank WHERE id = ?", (error_id,))
 
 
 def purge_all_errors():
     """Manually clear all entries from the Personal Error Bank."""
+    init_db()
     with get_connection() as conn:
         conn.execute("DELETE FROM error_bank")
 
 
 def get_error_stats() -> dict:
+    init_db()
     purge_expired_errors()
     with get_connection() as conn:
         total = conn.execute("SELECT COUNT(*) FROM error_bank").fetchone()[0]
