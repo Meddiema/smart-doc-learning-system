@@ -29,6 +29,16 @@ def _render_sidebar_cheat_sheet(location_key: str = "sidebar"):
         st.caption(f"⚠️ Cheat-sheet exporter unavailable: {exc}")
 
 
+def _render_command_interpreter():
+    """Import and render the Ethical Hacking Command & Output Interpreter safely."""
+    try:
+        from ui.network_interpreter_view import render_network_interpreter_view
+
+        render_network_interpreter_view()
+    except Exception as exc:
+        st.error(f"Command Interpreter unavailable: {exc}")
+
+
 @st.cache_data
 def get_css_content(file_path: str = os.path.join("assets", "styles.css")) -> str:
     if os.path.exists(file_path):
@@ -76,6 +86,7 @@ with st.sidebar:
             "📖 Document Library",
             "💬 AI Discussion Room",
             "⚡ Interactive Try-It Sandbox",
+            "🛡️ Command Interpreter",
             "📉 Personal Error Bank",
             "🖼️ Screenshot Analysis",
         ],
@@ -99,6 +110,8 @@ elif page == "💬 AI Discussion Room":
     render_ai_discussion_room()
 elif page == "⚡ Interactive Try-It Sandbox":
     render_try_it_sandbox()
+elif page == "🛡️ Command Interpreter":
+    _render_command_interpreter()
 elif page == "📉 Personal Error Bank":
     render_error_bank_view()
 elif page == "🖼️ Screenshot Analysis":
