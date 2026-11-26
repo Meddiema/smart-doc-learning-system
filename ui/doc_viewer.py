@@ -16,6 +16,11 @@ from core.ai_client import AIClient
 from core.cheat_sheet_exporter import record_study_note, render_cheat_sheet_download
 from database.error_bank_db import add_error
 
+try:
+    from ui.range_synthesis_panel import render_range_synthesis_panel
+except Exception:
+    render_range_synthesis_panel = None
+
 TRANSLATOR_SYSTEM_PROMPT = """
 You are an expert software engineering and cybersecurity tutor.
 When given a highlighted snippet from a technical manual, networking guide, or code doc, translate it into THREE formats and return ONLY strictly valid JSON (no markdown fences outside the JSON, no extra commentary):
@@ -219,17 +224,18 @@ def _save_browser_draft(
 
 
 def _clear_doc_viewer_state(session_storage: SessionStorage):
-    for k in (
-        "doc_highlight_input",
-        "doc_followup_input",
-        "doc_search_query",
-        "last_ai_bundle",
-        "doc_view_mode",
-        "active_page_quiz",
-        "quiz_graded_results",
-        "_doc_draft_restored",
-    ):
-        st.session_state.pop(k, None)
+    for k in list(st.session_state.keys()):
+        if k in (
+            "doc_highlight_input",
+            "doc_followup_input",
+            "doc_search_query",
+            "last_ai_bundle",
+            "doc_view_mode",
+            "active_page_quiz",
+            "quiz_graded_results",
+            "_doc_draft_restored",
+        ) or "_result_" in k:
+            st.session_state.pop(k, None)
     try:
         session_storage.deleteItem(DRAFT_KEY)
     except Exception:
@@ -578,7 +584,19 @@ def _render_reader_and_explainer(saved_pdfs: list[str], session_storage: Session
                     st.markdown("**Command Breakdown:**")
                     st.markdown(bundle["command_notes"])
 
-        # --- Section C: 1-Click Offline Cheat-Sheet Export (Zero API Cost) ---
+        # --- Section C: Multi-Page Flow & Industry Synthesis (Pages 1..N) ---
+        if render_range_synthesis_panel is not None:
+            st.markdown("---")
+            with st.expander("🧭 Multi-Page Flow & Industry Synthesis (Pages 1–100+)", expanded=False):
+                safe_doc_key = re.sub(r"[^A-Za-z0-9_-]+", "_", selected_pdf)
+                render_range_synthesis_panel(
+                    pages_input=pages,
+                    doc_title=selected_pdf,
+                    total_pages=total_pages,
+                    key_prefix=f"range_synth_{safe_doc_key}",
+                )
+
+        # --- Section D: 1-Click Offline Cheat-Sheet Export (Zero API Cost) ---
         st.markdown("---")
         render_cheat_sheet_download(location_key="doc_viewer")
 

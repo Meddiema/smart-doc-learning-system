@@ -39,6 +39,38 @@ def _render_command_interpreter():
         st.error(f"Command Interpreter unavailable: {exc}")
 
 
+def _render_standalone_range_synthesizer():
+    """Render full-width Multi-Page Flow & Industry Synthesis for any saved PDF."""
+    st.header("🧭 Multi-Page Flow & Industry Synthesis")
+    st.caption(
+        "Organize how ideas connect across a full chapter or multi-page span (e.g., pages 1–100), "
+        "understand their true meaning, and map them to real industry work."
+    )
+    try:
+        from core.pdf_processor import list_saved_pdfs, get_pdf_pages
+        from ui.range_synthesis_panel import render_range_synthesis_panel
+
+        saved_pdfs = list_saved_pdfs()
+        if not saved_pdfs:
+            st.info("No PDFs in your library yet. Upload one in **📖 Document Library** first.")
+            return
+
+        selected_pdf = st.selectbox(
+            "Select a document to synthesize:",
+            saved_pdfs,
+            key="standalone_synth_pdf",
+        )
+        pages = get_pdf_pages(selected_pdf)
+        render_range_synthesis_panel(
+            pages_input=pages,
+            doc_title=selected_pdf,
+            total_pages=max(1, len(pages)),
+            key_prefix=f"standalone_synth_{selected_pdf}",
+        )
+    except Exception as exc:
+        st.error(f"Multi-Page Synthesis unavailable: {exc}")
+
+
 @st.cache_data
 def get_css_content(file_path: str = os.path.join("assets", "styles.css")) -> str:
     if os.path.exists(file_path):
@@ -49,10 +81,16 @@ def get_css_content(file_path: str = os.path.join("assets", "styles.css")) -> st
 
 @st.cache_resource
 def bootstrap_database() -> bool:
-    """Initialize Turso/SQLite tables and run 7-day retention cleanup once per startup."""
+    """Initialize Turso/SQLite tables and run retention cleanups once per startup."""
     init_db()
     cleanup_expired_pdfs()
     purge_expired_screenshots()
+    try:
+        from database.error_bank_db import purge_expired_errors
+
+        purge_expired_errors()
+    except Exception:
+        pass
     return True
 
 
@@ -84,6 +122,7 @@ with st.sidebar:
         [
             "🏠 Dashboard",
             "📖 Document Library",
+            "🧭 Page-Range Synthesis",
             "💬 AI Discussion Room",
             "⚡ Interactive Try-It Sandbox",
             "🛡️ Command Interpreter",
@@ -106,6 +145,8 @@ if page == "🏠 Dashboard":
     render_dashboard()
 elif page == "📖 Document Library":
     render_doc_viewer()
+elif page == "🧭 Page-Range Synthesis":
+    _render_standalone_range_synthesizer()
 elif page == "💬 AI Discussion Room":
     render_ai_discussion_room()
 elif page == "⚡ Interactive Try-It Sandbox":
