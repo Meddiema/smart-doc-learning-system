@@ -1,34 +1,26 @@
-BATCH_PUZZLE_EXTRACTION_PROMPT = """
-You are a technical reading analyst extracting puzzle pieces from one sequential block of a technical manual.
-Given a batch of consecutive pages (for example, pages 1–20), extract ONLY the concrete building blocks introduced or refined in this span.
-Respond in 5–7 concise bullet points covering:
-- **Core Mechanism / Rule:** What system behavior, protocol, attack vector, or architecture principle is established here.
-- **Key Terms & Dependencies:** Any prerequisite concept from earlier pages that this section relies on, or new terms it introduces for later pages.
-- **Practical Signal:** Specific command, header, configuration, or edge case mentioned in these pages.
-Keep it dense, factual, and free of filler so a master synthesizer can connect this batch with adjacent batches.
+import re
+from collections import Counter
+
+SINGLE_PASS_PUZZLE_PROMPT = """
+You are a senior software engineering and cybersecurity mentor helping a learner put small technical puzzle pieces together across a multi-page span into one clear mental model.
+You will receive ordered milestone excerpts from across the requested page range (for example, pages 1–100).
+
+Respond in four concise, high-signal sections using ONLY ONE AI call:
+
+1. **🧩 Puzzle-Piece Connection Map:** A Markdown table (`Page Span | Puzzle Piece / Concept | How It Connects Forward`) showing how earlier pages set up later pages.
+2. **🔗 Putting the Pieces Together:** Explain how the separate mechanisms, rules, or steps connect into one unified system or workflow.
+3. **💡 What It Actually Means:** Translate the combined ideas into clear, practical meaning without filler.
+4. **🏭 Industry Work Application:** Give concrete ways to apply this in real engineering, system/network administration, or security work (workflows, checks, or trade-offs).
 """
 
-MASTER_PUZZLE_ASSEMBLY_PROMPT = """
-You are a senior software engineering and cybersecurity mentor helping a learner put small technical puzzle pieces together across a large reading span (such as pages 1–100) into one clear mental model.
-You will receive sequential Puzzle-Piece Ledgers extracted from consecutive page blocks across the selected range.
-
-Respond in four structured sections:
-
-1. **🧩 Puzzle-Piece Connection Map:** Present a concise Markdown table with columns `Page Block | Puzzle Piece Introduced | How It Connects to the Next Piece` showing the exact chain of dependencies from start to finish.
-2. **🔗 The Big Picture (Putting the Pieces Together):** Explain in clear, connected prose how all those separate mechanisms fit together as one unified system or workflow—resolve any apparent contradictions and highlight cause-and-effect links across pages.
-3. **💡 What It Actually Means in Practice:** Translate the combined concept into plain English without textbook jargon so the learner truly grasps *why* things are designed this way.
-4. **🏭 Industry Work Application:** Show concrete ways to apply this combined knowledge in real engineering, system/network administration, or security testing work (include specific review checks, debugging workflows, or defensive/offensive trade-offs).
-"""
-
-RANGE_SYNTHESIS_SYSTEM_PROMPT = """
-You are a senior technical mentor helping an engineer or security practitioner make sense of a multi-page reading span.
-Given extracted text from a page range, respond in four clear sections:
-
-1. **🧩 Puzzle-Piece Connection Map:** A concise Markdown table (`Pages | Puzzle Piece | How It Connects Forward`) tracing how early ideas unlock later ones.
-2. **🔗 The Big Picture (Putting the Pieces Together):** Explain how the parts work together as one coherent system.
-3. **💡 What It Actually Means in Practice:** Translate the core ideas into clear, practical meaning.
-4. **🏭 Industry Work Application:** Show concrete workflows, review checks, or trade-offs for real-world engineering or security work.
-"""
+STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
+    "have", "has", "had", "will", "would", "could", "should", "into", "your",
+    "you", "can", "all", "any", "not", "but", "use", "using", "used", "when",
+    "what", "which", "who", "how", "why", "where", "then", "than", "also",
+    "each", "more", "most", "some", "such", "only", "over", "after", "before",
+    "between", "through", "about", "page", "pages", "section", "chapter", "note",
+}
 
 
 def _normalize_pages(pages_input) -> list[tuple[int, str]]:
@@ -63,115 +55,76 @@ def _normalize_pages(pages_input) -> list[tuple[int, str]]:
     return normalized
 
 
-def build_sequential_batches(
+def build_single_call_range_digest(
     pages_input,
     start_page: int,
     end_page: int,
-    batch_size: int = 20,
-    per_page_cap: int = 1100,
-    max_batch_chars: int = 22000,
+    focus_topic: str = "",
+    max_total_chars: int = 24000,
+    max_slices: int = 16,
 ) -> dict:
-    """Split [start_page, end_page] into consecutive non-skipping batches for Deep Multi-Pass synthesis."""
+    """
+    Build a compact, ordered multi-checkpoint digest across [start_page, end_page]
+    so a SINGLE AI call can connect early, middle, and late pages in the span.
+    """
     pages = _normalize_pages(pages_input)
     lo = min(int(start_page), int(end_page))
     hi = max(int(start_page), int(end_page))
-    in_range = [(p, t) for (p, t) in pages if lo <= p <= hi]
+    in_range = [
+        (p, " ".join(str(t or "").split()))
+        for (p, t) in pages
+        if lo <= p <= hi and str(t or "").strip()
+    ]
 
     if not in_range:
         return {
             "selected_count": 0,
-            "actual_start": lo,
-            "actual_end": hi,
-            "batches": [],
-        }
-
-    batches = []
-    for i in range(0, len(in_range), max(1, int(batch_size))):
-        window = in_range[i : i + int(batch_size)]
-        blocks = []
-        used_chars = 0
-        for p_num, text in window:
-            cleaned = " ".join(str(text or "").split())
-            if not cleaned:
-                continue
-            snippet = cleaned[:per_page_cap]
-            if len(cleaned) > per_page_cap:
-                snippet += " ..."
-            chunk = f"[Page {p_num}]\n{snippet}\n"
-            if used_chars + len(chunk) > max_batch_chars:
-                break
-            blocks.append(chunk)
-            used_chars += len(chunk)
-
-        if blocks:
-            batches.append(
-                {
-                    "batch_index": len(batches) + 1,
-                    "start_page": window[0][0],
-                    "end_page": window[-1][0],
-                    "page_count": len(window),
-                    "digest_text": "\n".join(blocks).strip(),
-                }
-            )
-
-    return {
-        "selected_count": len(in_range),
-        "actual_start": in_range[0][0],
-        "actual_end": in_range[-1][0],
-        "batches": batches,
-    }
-
-
-def build_page_window_digest(
-    pages_input,
-    start_page: int,
-    end_page: int,
-    max_total_chars: int = 28000,
-    per_page_cap: int = 900,
-) -> dict:
-    """Select pages in [start_page, end_page] and build a fast sampled prompt payload."""
-    pages = _normalize_pages(pages_input)
-    lo = min(int(start_page), int(end_page))
-    hi = max(int(start_page), int(end_page))
-    if not pages:
-        return {
-            "selected_count": 0,
-            "sampled_count": 0,
+            "included_count": 0,
             "actual_start": lo,
             "actual_end": hi,
             "digest_text": "",
+            "top_terms": [],
         }
 
-    in_range = [(p, t) for (p, t) in pages if lo <= p <= hi]
-    if not in_range:
-        return {
-            "selected_count": 0,
-            "sampled_count": 0,
-            "actual_start": lo,
-            "actual_end": hi,
-            "digest_text": "",
-        }
+    # Extract top recurring technical terms across the selected range (0 API cost)
+    focus_terms = {w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", focus_topic or "")}
+    word_counts = Counter()
+    for _, clean_txt in in_range:
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{3,}", clean_txt.lower()):
+            if tok not in STOPWORDS:
+                word_counts[tok] += 1
+    top_terms = [w for w, _ in word_counts.most_common(10)]
 
-    selected_count = len(in_range)
-    max_slices = 24
-    if selected_count > max_slices:
-        step = selected_count / max_slices
-        sampled = [in_range[min(int(i * step), selected_count - 1)] for i in range(max_slices)]
-        if sampled[0] != in_range[0]:
-            sampled[0] = in_range[0]
-        if sampled[-1] != in_range[-1]:
-            sampled[-1] = in_range[-1]
+    # Choose checkpoints evenly across the range, prioritizing pages matching focus_terms if given
+    n = len(in_range)
+    if n <= max_slices:
+        chosen = in_range
     else:
-        sampled = in_range
+        step = n / max_slices
+        indices = sorted({min(int(i * step), n - 1) for i in range(max_slices)})
+        indices[0] = 0
+        indices[-1] = n - 1
 
+        if focus_terms:
+            scored = []
+            for idx, (p_num, txt) in enumerate(in_range):
+                hits = sum(1 for ft in focus_terms if ft in txt.lower())
+                if hits > 0:
+                    scored.append((hits, idx))
+            scored.sort(reverse=True)
+            for _, idx in scored[:4]:
+                if idx not in indices and len(indices) < max_slices:
+                    indices.append(idx)
+            indices.sort()
+
+        chosen = [in_range[i] for i in indices]
+
+    per_slice_cap = max(550, min(1400, max_total_chars // max(1, len(chosen))))
     blocks = []
     used_chars = 0
-    for p_num, text in sampled:
-        cleaned = " ".join(str(text or "").split())
-        if not cleaned:
-            continue
-        snippet = cleaned[:per_page_cap]
-        if len(cleaned) > per_page_cap:
+    for p_num, clean_txt in chosen:
+        snippet = clean_txt[:per_slice_cap]
+        if len(clean_txt) > per_slice_cap:
             snippet += " ..."
         chunk = f"[Page {p_num}]\n{snippet}\n"
         if used_chars + len(chunk) > max_total_chars:
@@ -180,11 +133,12 @@ def build_page_window_digest(
         used_chars += len(chunk)
 
     return {
-        "selected_count": selected_count,
-        "sampled_count": len(blocks),
+        "selected_count": n,
+        "included_count": len(blocks),
         "actual_start": in_range[0][0],
         "actual_end": in_range[-1][0],
         "digest_text": "\n".join(blocks).strip(),
+        "top_terms": top_terms,
     }
 
 
@@ -194,14 +148,14 @@ def format_range_synthesis_markdown(
     end_page: int,
     focus_topic: str,
     synthesis_body: str,
-    mode_label: str = "Deep Multi-Pass",
+    mode_label: str = "1 AI Call",
 ) -> str:
-    """Format a multi-page synthesis note for display and cheat-sheet export."""
+    """Format a 1-call multi-page synthesis note for display and cheat-sheet export."""
     clean_doc = (doc_title or "Uploaded Document").strip()
-    focus_line = f"- **Focus / Anchor Question:** {focus_topic.strip()}\n" if (focus_topic or "").strip() else ""
+    focus_line = f"- **Focus / Anchor:** {focus_topic.strip()}\n" if (focus_topic or "").strip() else ""
     return (
         f"# 🧩 Multi-Page Puzzle & Industry Synthesis: `{clean_doc}`\n"
-        f"- **Page Range:** Pages {start_page}–{end_page} ({mode_label})\n"
+        f"- **Page Range:** Pages {start_page}–{end_page} *({mode_label})*\n"
         f"{focus_line}\n"
         f"{(synthesis_body or '').strip()}"
     ).strip()

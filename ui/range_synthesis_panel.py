@@ -2,15 +2,10 @@ import streamlit as st
 from core.ai_client import AIClient
 from core.cheat_sheet_exporter import record_study_note
 from core.range_synthesizer import (
-    BATCH_PUZZLE_EXTRACTION_PROMPT,
-    MASTER_PUZZLE_ASSEMBLY_PROMPT,
-    RANGE_SYNTHESIS_SYSTEM_PROMPT,
-    build_page_window_digest,
-    build_sequential_batches,
+    SINGLE_PASS_PUZZLE_PROMPT,
+    build_single_call_range_digest,
     format_range_synthesis_markdown,
 )
-
-MAX_DEEP_BATCHES = 6  # Hard cap (6 batches + 1 master assembly = 7 calls max per run)
 
 
 def _is_blocked_or_error(response_text: str) -> bool:
@@ -25,18 +20,18 @@ def render_range_synthesis_panel(
     total_pages: int | None = None,
     key_prefix: str = "doc_range_synth",
 ) -> None:
-    """Render UI to assemble puzzle pieces across a page range (e.g., 1..100) into one clear mental model."""
+    """Render 1-call Multi-Page Puzzle & Industry Synthesis across any page range (e.g., 1..100)."""
     st.subheader("🧭 Multi-Page Puzzle & Industry Synthesis")
     st.caption(
         "Connect the small puzzle pieces across a range of pages you read (for example, pages 1–100) "
-        "into one unified explanation and see how to use it in industry work."
+        "into one unified explanation and see how to use it in industry work — using **1 AI call** per synthesis."
     )
 
     try:
         q_status = AIClient.get_quota_status()
         st.caption(
             f"🛡️ AI Quota Guard: **{q_status['rpm_left']}/{q_status['rpm_limit']}** calls available this minute • "
-            f"**{q_status['daily_left']}/{q_status['daily_limit']}** remaining today"
+            f"**{q_status['daily_left']}/{q_status['daily_limit']}** remaining today • **1 AI call** per run"
         )
     except Exception:
         pass
@@ -72,211 +67,80 @@ def render_range_synthesis_panel(
     with c3:
         focus_topic = st.text_input(
             "Anchor Question or Role Lens (Optional):",
-            placeholder="e.g., How do tokens, sessions, and CSRF defenses fit together?",
+            placeholder="e.g., How do decorators, iterators, and context managers connect?",
             key=f"{key_prefix}_focus",
         )
 
-    depth_mode = st.radio(
-        "Synthesis Depth:",
-        [
-            "🧠 Deep Multi-Pass (Reads every 20-page batch in sequence — best for connecting 1–100 pages)",
-            "⚡ Fast Overview (Single sampled pass — 1 AI call)",
-        ],
-        horizontal=True,
-        key=f"{key_prefix}_depth_mode",
+    digest = build_single_call_range_digest(
+        pages_input,
+        int(start_page),
+        int(end_page),
+        focus_topic=focus_topic,
     )
-    is_deep_mode = depth_mode.startswith("🧠")
+    if digest["top_terms"]:
+        st.caption("🔑 Top terms in range (0 AI cost): " + ", ".join(f"`{t}`" for t in digest["top_terms"]))
 
     state_key = f"{key_prefix}_result_{doc_title}"
 
     if st.button(
-        f"🧩 Connect Pages {int(start_page)}–{int(end_page)} into One Clear Picture",
+        f"🧩 Connect Pages {int(start_page)}–{int(end_page)} (1 AI Call)",
         type="primary",
         use_container_width=True,
         key=f"{key_prefix}_run_btn",
     ):
+        if not digest["digest_text"]:
+            st.warning("No readable text found in that page range. Check the page numbers or document text extraction.")
+            return
+
+        allowed, block_msg = AIClient.can_run_pipeline(1)
+        if not allowed:
+            st.warning(block_msg)
+            return
+
         ai = AIClient()
-        focus_part = f"Anchor Question / Focus Lens: {focus_topic.strip()}\n" if focus_topic.strip() else ""
-
-        if is_deep_mode:
-            batch_plan = build_sequential_batches(
-                pages_input,
-                int(start_page),
-                int(end_page),
-                batch_size=20,
-            )
-            batches = batch_plan["batches"]
-            if not batches:
-                st.warning("No readable text found in that page range. Check the page numbers or document text extraction.")
-                return
-
-            if len(batches) > MAX_DEEP_BATCHES:
-                st.warning(
-                    f"🛑 Quota protection: Pages {int(start_page)}–{int(end_page)} require **{len(batches)} batches**, "
-                    f"exceeding the safety cap of **{MAX_DEEP_BATCHES} batches** (~{MAX_DEEP_BATCHES * 20} pages) per run. "
-                    "Narrow the page range or switch to **⚡ Fast Overview** (1 call)."
-                )
-                return
-
-            total_steps = len(batches) + 1
-            allowed, block_msg = AIClient.can_run_pipeline(total_steps)
-            if not allowed:
-                st.warning(block_msg)
-                return
-
-            progress_bar = st.progress(0, text="Starting sequential puzzle-piece extraction...")
-            ledgers = []
-
-            for idx, batch in enumerate(batches, start=1):
-                progress_bar.progress(
-                    int(((idx - 1) / total_steps) * 100),
-                    text=f"Step {idx}/{total_steps}: Extracting puzzle pieces from pages {batch['start_page']}–{batch['end_page']}...",
-                )
-                batch_prompt = (
-                    f"Document: {doc_title}\n"
-                    f"Batch {idx} of {len(batches)} (Pages {batch['start_page']}–{batch['end_page']})\n"
-                    f"{focus_part}\n"
-                    f"Page Text:\n{batch['digest_text']}"
-                )
-                # Enforce user cooldown on step 1, bypass per-user cooldown on internal pipeline steps
-                ledger_text = ai.ask(
-                    batch_prompt,
-                    system_instruction=BATCH_PUZZLE_EXTRACTION_PROMPT,
-                    bypass_user_cooldown=(idx > 1),
-                )
-                if _is_blocked_or_error(ledger_text):
-                    progress_bar.empty()
-                    st.warning(ledger_text)
-                    return
-
-                ledgers.append(
-                    {
-                        "span": f"Pages {batch['start_page']}–{batch['end_page']}",
-                        "ledger": ledger_text.strip(),
-                    }
-                )
-
-            progress_bar.progress(
-                int((len(batches) / total_steps) * 100),
-                text=f"Step {total_steps}/{total_steps}: Assembling all puzzle pieces across pages {batch_plan['actual_start']}–{batch_plan['actual_end']}...",
-            )
-
-            combined_ledgers_text = "\n\n".join(
-                f"### [{item['span']}]\n{item['ledger']}" for item in ledgers
-            )
-            master_prompt = (
+        with st.spinner(
+            f"Connecting puzzle pieces across pages {digest['actual_start']}–{digest['actual_end']}..."
+        ):
+            focus_part = f"Anchor / Focus Lens: {focus_topic.strip()}\n" if focus_topic.strip() else ""
+            prompt = (
                 f"Document: {doc_title}\n"
-                f"Full Selected Span: Pages {batch_plan['actual_start']}–{batch_plan['actual_end']} "
-                f"({batch_plan['selected_count']} pages analyzed across {len(batches)} sequential batches)\n"
+                f"Page Range: {digest['actual_start']}–{digest['actual_end']} "
+                f"({digest['included_count']} checkpoints sampled across {digest['selected_count']} pages)\n"
                 f"{focus_part}\n"
-                f"Sequential Puzzle-Piece Ledgers:\n{combined_ledgers_text}"
+                f"Ordered Page Checkpoints:\n{digest['digest_text']}"
             )
-            ai_output = ai.ask(
-                master_prompt,
-                system_instruction=MASTER_PUZZLE_ASSEMBLY_PROMPT,
-                bypass_user_cooldown=True,
-            )
-            progress_bar.empty()
+            ai_output = ai.ask(prompt, system_instruction=SINGLE_PASS_PUZZLE_PROMPT)
 
-            if _is_blocked_or_error(ai_output):
-                st.warning(ai_output)
-                return
+        if _is_blocked_or_error(ai_output):
+            st.warning(ai_output)
+            return
 
-            formatted_md = format_range_synthesis_markdown(
-                doc_title=doc_title,
-                start_page=int(start_page),
-                end_page=int(end_page),
-                focus_topic=focus_topic,
-                synthesis_body=ai_output,
-                mode_label=f"Deep Multi-Pass • {len(batches)} sequential batches",
-            )
-            st.session_state[state_key] = {
-                "markdown": formatted_md,
-                "meta": {
-                    "mode": "deep",
-                    "actual_start": batch_plan["actual_start"],
-                    "actual_end": batch_plan["actual_end"],
-                    "selected_count": batch_plan["selected_count"],
-                    "batch_count": len(batches),
-                },
-                "ledgers": ledgers,
-            }
-        else:
-            digest = build_page_window_digest(pages_input, int(start_page), int(end_page))
-            if not digest["digest_text"]:
-                st.warning("No readable text found in that page range. Check the page numbers or document text extraction.")
-                return
-
-            allowed, block_msg = AIClient.can_run_pipeline(1)
-            if not allowed:
-                st.warning(block_msg)
-                return
-
-            with st.spinner(
-                f"Connecting themes across pages {digest['actual_start']}–{digest['actual_end']}..."
-            ):
-                prompt = (
-                    f"Document: {doc_title}\n"
-                    f"Requested Page Range: {int(start_page)} to {int(end_page)} "
-                    f"(Pages in range: {digest['selected_count']}, Excerpts sampled: {digest['sampled_count']})\n"
-                    f"{focus_part}\n"
-                    f"Extracted Page Excerpts:\n{digest['digest_text']}"
-                )
-                ai_output = ai.ask(prompt, system_instruction=RANGE_SYNTHESIS_SYSTEM_PROMPT)
-                if _is_blocked_or_error(ai_output):
-                    st.warning(ai_output)
-                    return
-
-                formatted_md = format_range_synthesis_markdown(
-                    doc_title=doc_title,
-                    start_page=int(start_page),
-                    end_page=int(end_page),
-                    focus_topic=focus_topic,
-                    synthesis_body=ai_output,
-                    mode_label="Fast Overview",
-                )
-                st.session_state[state_key] = {
-                    "markdown": formatted_md,
-                    "meta": {
-                        "mode": "fast",
-                        "actual_start": digest["actual_start"],
-                        "actual_end": digest["actual_end"],
-                        "selected_count": digest["selected_count"],
-                        "sampled_count": digest["sampled_count"],
-                    },
-                    "ledgers": [],
-                }
-
+        formatted_md = format_range_synthesis_markdown(
+            doc_title=doc_title,
+            start_page=int(start_page),
+            end_page=int(end_page),
+            focus_topic=focus_topic,
+            synthesis_body=ai_output,
+        )
+        st.session_state[state_key] = {
+            "markdown": formatted_md,
+            "meta": digest,
+        }
         record_study_note(
             source="Page Range Synthesizer",
             title=f"{doc_title} (Pages {int(start_page)}–{int(end_page)})",
-            explanation=st.session_state[state_key]["markdown"],
-            command_notes="Connected multi-page puzzle pieces into a unified mental model and industry guide.",
+            explanation=formatted_md,
+            command_notes="Single-call multi-page puzzle connection and industry application.",
         )
         st.toast("Saved multi-page puzzle synthesis to your session cheat-sheet!")
 
     saved = st.session_state.get(state_key)
     if saved and isinstance(saved, dict):
         meta = saved.get("meta", {})
-        if meta.get("mode") == "deep":
+        if meta:
             st.caption(
-                f"Analyzed **all {meta.get('selected_count')} pages** "
-                f"(pages **{meta.get('actual_start')}–{meta.get('actual_end')}**) across "
-                f"**{meta.get('batch_count')} sequential batches**."
-            )
-        elif meta:
-            st.caption(
-                f"Sampled **{meta.get('sampled_count')} excerpts** across "
+                f"Connected **{meta.get('included_count')} checkpoints** across "
                 f"**{meta.get('selected_count')} pages** "
-                f"(pages **{meta.get('actual_start')}–{meta.get('actual_end')}**)."
+                f"(pages **{meta.get('actual_start')}–{meta.get('actual_end')}**) using **1 AI call**."
             )
-
         st.markdown(saved.get("markdown", ""))
-
-        ledgers = saved.get("ledgers") or []
-        if ledgers:
-            with st.expander("🔍 Inspect Extracted Puzzle Pieces per 20-Page Block", expanded=False):
-                for item in ledgers:
-                    st.markdown(f"**{item['span']}**")
-                    st.markdown(item["ledger"])
-                    st.markdown("---")
