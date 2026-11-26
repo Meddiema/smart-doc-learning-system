@@ -10,6 +10,14 @@ from core.range_synthesizer import (
     format_range_synthesis_markdown,
 )
 
+MAX_DEEP_BATCHES = 6  # Hard cap (6 batches + 1 master assembly = 7 calls max per run)
+
+
+def _is_blocked_or_error(response_text: str) -> bool:
+    """Detect rate-limit blocks or API error messages returned by AIClient."""
+    cleaned = (response_text or "").strip()
+    return not cleaned or cleaned.startswith("🛑") or cleaned.startswith("⚠️")
+
 
 def render_range_synthesis_panel(
     pages_input,
@@ -23,6 +31,15 @@ def render_range_synthesis_panel(
         "Connect the small puzzle pieces across a range of pages you read (for example, pages 1–100) "
         "into one unified explanation and see how to use it in industry work."
     )
+
+    try:
+        q_status = AIClient.get_quota_status()
+        st.caption(
+            f"🛡️ AI Quota Guard: **{q_status['rpm_left']}/{q_status['rpm_limit']}** calls available this minute • "
+            f"**{q_status['daily_left']}/{q_status['daily_limit']}** remaining today"
+        )
+    except Exception:
+        pass
 
     max_p = int(total_pages) if (total_pages and total_pages > 0) else 100
     if isinstance(pages_input, dict) and pages_input:
@@ -62,8 +79,8 @@ def render_range_synthesis_panel(
     depth_mode = st.radio(
         "Synthesis Depth:",
         [
-            "🧠 Deep Multi-Pass (Reads every batch in sequence — best for connecting 1–100 pages)",
-            "⚡ Fast Overview (Single sampled pass — quickest check)",
+            "🧠 Deep Multi-Pass (Reads every 20-page batch in sequence — best for connecting 1–100 pages)",
+            "⚡ Fast Overview (Single sampled pass — 1 AI call)",
         ],
         horizontal=True,
         key=f"{key_prefix}_depth_mode",
@@ -93,9 +110,22 @@ def render_range_synthesis_panel(
                 st.warning("No readable text found in that page range. Check the page numbers or document text extraction.")
                 return
 
+            if len(batches) > MAX_DEEP_BATCHES:
+                st.warning(
+                    f"🛑 Quota protection: Pages {int(start_page)}–{int(end_page)} require **{len(batches)} batches**, "
+                    f"exceeding the safety cap of **{MAX_DEEP_BATCHES} batches** (~{MAX_DEEP_BATCHES * 20} pages) per run. "
+                    "Narrow the page range or switch to **⚡ Fast Overview** (1 call)."
+                )
+                return
+
+            total_steps = len(batches) + 1
+            allowed, block_msg = AIClient.can_run_pipeline(total_steps)
+            if not allowed:
+                st.warning(block_msg)
+                return
+
             progress_bar = st.progress(0, text="Starting sequential puzzle-piece extraction...")
             ledgers = []
-            total_steps = len(batches) + 1
 
             for idx, batch in enumerate(batches, start=1):
                 progress_bar.progress(
@@ -108,7 +138,17 @@ def render_range_synthesis_panel(
                     f"{focus_part}\n"
                     f"Page Text:\n{batch['digest_text']}"
                 )
-                ledger_text = ai.ask(batch_prompt, system_instruction=BATCH_PUZZLE_EXTRACTION_PROMPT)
+                # Enforce user cooldown on step 1, bypass per-user cooldown on internal pipeline steps
+                ledger_text = ai.ask(
+                    batch_prompt,
+                    system_instruction=BATCH_PUZZLE_EXTRACTION_PROMPT,
+                    bypass_user_cooldown=(idx > 1),
+                )
+                if _is_blocked_or_error(ledger_text):
+                    progress_bar.empty()
+                    st.warning(ledger_text)
+                    return
+
                 ledgers.append(
                     {
                         "span": f"Pages {batch['start_page']}–{batch['end_page']}",
@@ -131,9 +171,16 @@ def render_range_synthesis_panel(
                 f"{focus_part}\n"
                 f"Sequential Puzzle-Piece Ledgers:\n{combined_ledgers_text}"
             )
-            ai_output = ai.ask(master_prompt, system_instruction=MASTER_PUZZLE_ASSEMBLY_PROMPT)
-            progress_bar.progress(100, text="Puzzle assembly complete!")
+            ai_output = ai.ask(
+                master_prompt,
+                system_instruction=MASTER_PUZZLE_ASSEMBLY_PROMPT,
+                bypass_user_cooldown=True,
+            )
             progress_bar.empty()
+
+            if _is_blocked_or_error(ai_output):
+                st.warning(ai_output)
+                return
 
             formatted_md = format_range_synthesis_markdown(
                 doc_title=doc_title,
@@ -160,6 +207,11 @@ def render_range_synthesis_panel(
                 st.warning("No readable text found in that page range. Check the page numbers or document text extraction.")
                 return
 
+            allowed, block_msg = AIClient.can_run_pipeline(1)
+            if not allowed:
+                st.warning(block_msg)
+                return
+
             with st.spinner(
                 f"Connecting themes across pages {digest['actual_start']}–{digest['actual_end']}..."
             ):
@@ -171,6 +223,10 @@ def render_range_synthesis_panel(
                     f"Extracted Page Excerpts:\n{digest['digest_text']}"
                 )
                 ai_output = ai.ask(prompt, system_instruction=RANGE_SYNTHESIS_SYSTEM_PROMPT)
+                if _is_blocked_or_error(ai_output):
+                    st.warning(ai_output)
+                    return
+
                 formatted_md = format_range_synthesis_markdown(
                     doc_title=doc_title,
                     start_page=int(start_page),
