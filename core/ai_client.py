@@ -81,7 +81,6 @@ class AIClient:
     def __init__(self):
         limiter = _get_global_rate_limiter()
         with limiter["lock"]:
-            # Refresh key list if secrets/env changed
             current_keys = _load_api_keys()
             if current_keys and current_keys != limiter.get("keys"):
                 limiter["keys"] = current_keys
@@ -122,7 +121,6 @@ class AIClient:
             if not limiter["key_exhausted_day"].get(idx, False)
             and now >= limiter["key_cooldown_until"].get(idx, 0.0)
         ]
-        # If all keys are in temporary cooldown (but not all daily-exhausted), still allow fallback order
         if not usable:
             usable = [
                 idx for idx in ordered
@@ -174,7 +172,7 @@ class AIClient:
         if status["total_keys"] > 0 and status["usable_keys"] == 0:
             return (
                 False,
-                "🛑 All configured Gemini API keys have hit their daily quota for today. "
+                f"🛑 All {status['total_keys']} configured Gemini API key(s) have hit their daily quota for today. "
                 "Add a fresh key or try again after the daily quota reset.",
             )
 
@@ -196,10 +194,7 @@ class AIClient:
         return True, ""
 
     def _check_and_reserve_slot(self, bypass_user_cooldown: bool = False) -> tuple[bool, str]:
-        """
-        Blocks rapid per-user clicks (unless bypassed internally for multi-step pipelines)
-        AND enforces both server-wide RPM and daily RPD ceilings BEFORE sending any request.
-        """
+        """Enforce per-user cooldown plus server-wide RPM and daily RPD ceilings."""
         now = time.time()
 
         if not bypass_user_cooldown:
@@ -255,6 +250,14 @@ class AIClient:
         return True, ""
 
     @staticmethod
+    def _release_failed_daily_slot() -> None:
+        """Refund the local daily counter if upstream rejected the call across all keys."""
+        limiter = _get_global_rate_limiter()
+        with limiter["lock"]:
+            if limiter["daily_count"] > 0:
+                limiter["daily_count"] -= 1
+
+    @staticmethod
     def _sanitize_contents(contents):
         """Clamp oversized text strings to prevent accidental token spikes."""
         if isinstance(contents, str) and len(contents) > MAX_INPUT_CHARS:
@@ -289,7 +292,6 @@ class AIClient:
             n = len(limiter.get("keys") or [])
             if is_daily:
                 limiter["key_exhausted_day"][key_idx] = True
-                # Advance active pointer to next non-exhausted key if available
                 for step in range(1, n + 1):
                     cand = (key_idx + step) % n
                     if not limiter["key_exhausted_day"].get(cand, False):
@@ -359,18 +361,23 @@ class AIClient:
                         if should_retry or any(
                             code in last_error for code in ("503", "UNAVAILABLE", "429", "DEADLINE", "timeout")
                         ):
-                            time.sleep(1.0 * (attempt + 1))
+                            time.sleep(0.8 * (attempt + 1))
                             continue
-                        return f"⚠️ AI Error: {last_error}"
+                        self._release_failed_daily_slot()
+                        return f"⚠️ AI Error (Key #{key_idx + 1}): {last_error}"
 
                 if switch_key:
                     break
 
+        self._release_failed_daily_slot()
         status = self.get_quota_status()
         if status["total_keys"] > 0 and status["usable_keys"] == 0:
-            return "🛑 All configured Gemini API keys hit their daily free-tier quota. Try again after daily quota reset."
+            return (
+                f"🛑 All {status['total_keys']} configured Gemini API key(s) hit daily free-tier quota limits. "
+                f"Detail: {last_error[:180]}"
+            )
 
-        return f"⚠️ AI Error (after key/model retries): {last_error}"
+        return f"⚠️ AI Error across {status['total_keys']} key(s): {last_error[:200]}"
 
     def ask(
         self,
