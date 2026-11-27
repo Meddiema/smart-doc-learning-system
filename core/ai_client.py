@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 import threading
 from collections import deque
 from datetime import datetime, timezone
@@ -8,12 +9,13 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# Adjust these limits to protect your free-tier Gemini quota
-MAX_REQUESTS_PER_MINUTE = 8          # Global RPM cap across ALL users per 60s
-MAX_REQUESTS_PER_DAY = 180           # Global RPD cap across ALL users per UTC day
-MIN_SECONDS_BETWEEN_USER_CALLS = 15  # Per-user cooldown to block rapid clicking
-MAX_INPUT_CHARS = 32_000             # Safety ceiling per prompt payload
-KEY_429_COOLDOWN_SECONDS = 65        # Cooldown before retrying a key that hit RPM 429
+# Protective guardrails tuned for 3 free-tier Flash-Lite projects
+MAX_REQUESTS_PER_MINUTE = 12         # Spread across 3 keys = ~4 RPM per project
+MAX_REQUESTS_PER_DAY = 900           # Safe ceiling below ~1,500 combined RPD
+MIN_SECONDS_BETWEEN_USER_CALLS = 10  # Prevents accidental double-click bursts
+MAX_INPUT_CHARS = 14_000             # ~3,500 tokens: prevents TPM 429 spikes
+MAX_OUTPUT_TOKENS = 1_600            # Keeps responses crisp and fast
+KEY_429_COOLDOWN_SECONDS = 65        # Cooldown before retrying an RPM-limited key
 
 
 def _load_api_keys() -> list[str]:
@@ -32,13 +34,13 @@ def _load_api_keys() -> list[str]:
             if cleaned and cleaned not in candidates:
                 candidates.append(cleaned)
 
-    secret_names = (
+    for name in (
         "GEMINI_API_KEYS",
         "GEMINI_API_KEY",
+        "GEMINI_API_KEY_1",
         "GEMINI_API_KEY_2",
         "GEMINI_API_KEY_3",
-    )
-    for name in secret_names:
+    ):
         try:
             _add_raw(st.secrets.get(name))
         except Exception:
@@ -62,6 +64,7 @@ def _get_global_rate_limiter():
         "active_key_idx": 0,
         "key_exhausted_day": {i: False for i in range(len(keys))},
         "key_cooldown_until": {i: 0.0 for i in range(len(keys))},
+        "response_cache": {},  # In-memory cache to avoid duplicate API calls
     }
 
 
@@ -72,6 +75,7 @@ def _roll_utc_day_if_needed(limiter: dict) -> None:
         limiter["utc_day"] = today
         limiter["daily_count"] = 0
         limiter["daily_exhausted"] = False
+        limiter["response_cache"].clear()
         for idx in range(len(limiter.get("keys", []))):
             limiter["key_exhausted_day"][idx] = False
 
@@ -90,12 +94,12 @@ class AIClient:
 
         if not keys:
             raise ValueError(
-                "No Gemini API key found. Set GEMINI_API_KEY (and optionally GEMINI_API_KEY_2, GEMINI_API_KEY_3) "
-                "in .streamlit/secrets.toml or environment variables."
+                "No Gemini API key found. Set GEMINI_API_KEY, GEMINI_API_KEY_2, and GEMINI_API_KEY_3 in Secrets."
             )
 
         self.api_keys = keys
-        self.models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+        # Flash-Lite first (~500 RPD/project) with Flash as secondary fallback
+        self.models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
         self._clients: dict[int, genai.Client] = {}
 
     def _get_client_for_key(self, key_idx: int) -> genai.Client:
@@ -171,23 +175,20 @@ class AIClient:
         if status["total_keys"] > 0 and status["usable_keys"] == 0:
             return (
                 False,
-                f"🛑 All {status['total_keys']} configured Gemini API key(s) have hit their daily quota for today. "
-                "Add a fresh key or try again after the daily quota reset.",
+                f"🛑 All {status['total_keys']} configured Gemini API key(s) hit their daily quota. "
+                "Daily free-tier quotas reset at midnight Pacific Time (11:00 AM EAT).",
             )
 
         if status["daily_exhausted"] or status["daily_left"] < needed:
             return (
                 False,
-                f"🛑 Daily quota protection: this action needs {needed} AI call(s), but only "
-                f"{status['daily_left']} daily call(s) remain today. Use a smaller page range.",
+                f"🛑 Daily quota protection: needs {needed} AI call(s), only {status['daily_left']} left today.",
             )
 
         if status["rpm_left"] < needed:
             return (
                 False,
-                f"🛑 Burst protection: this action needs {needed} AI call(s), but only "
-                f"{status['rpm_left']}/{status['rpm_limit']} RPM slots are free right now. "
-                f"Wait ~{status['rpm_reset_in']}s before retrying.",
+                f"🛑 Burst protection: wait ~{status['rpm_reset_in']}s for RPM slots to clear.",
             )
 
         return True, ""
@@ -203,7 +204,7 @@ class AIClient:
                 if user_wait > 0:
                     return (
                         False,
-                        f"🛑 Slow down: please wait {int(user_wait) + 1} seconds before sending another request.",
+                        f"🛑 Cooldown active: wait {int(user_wait) + 1}s before sending the next request.",
                     )
             except Exception:
                 pass
@@ -218,14 +219,13 @@ class AIClient:
                 return (
                     False,
                     "🛑 All configured Gemini API keys have reached their daily quota. "
-                    "Use zero-API features (PDF search, offline cheat-sheet, local quiz grading) until quota resets.",
+                    "Use zero-API features (PDF search, offline cheat-sheet, local quiz) until reset.",
                 )
 
             if limiter["daily_exhausted"] or limiter["daily_count"] >= MAX_REQUESTS_PER_DAY:
                 return (
                     False,
-                    f"🛑 Daily AI quota cap ({MAX_REQUESTS_PER_DAY} requests/day) reached to protect your API keys. "
-                    "Use zero-API features until tomorrow.",
+                    f"🛑 Daily AI quota cap ({MAX_REQUESTS_PER_DAY} requests/day) reached to protect your keys.",
                 )
 
             while limiter["timestamps"] and now - limiter["timestamps"][0] >= 60.0:
@@ -235,7 +235,7 @@ class AIClient:
                 reset_in = int(60.0 - (now - limiter["timestamps"][0])) + 1
                 return (
                     False,
-                    f"🛑 Rate limit protection active: server quota is full for this minute. Try again in {reset_in}s.",
+                    f"🛑 Rate limit shield active: server quota full for this minute. Try again in {reset_in}s.",
                 )
 
             limiter["timestamps"].append(now)
@@ -258,7 +258,7 @@ class AIClient:
 
     @staticmethod
     def _sanitize_contents(contents):
-        """Clamp oversized text strings to prevent accidental token spikes."""
+        """Clamp oversized text strings to prevent TPM spikes."""
         if isinstance(contents, str) and len(contents) > MAX_INPUT_CHARS:
             return contents[:MAX_INPUT_CHARS] + "\n\n[Truncated to protect token quota]"
         if isinstance(contents, list):
@@ -273,10 +273,7 @@ class AIClient:
 
     @staticmethod
     def _record_key_failure(key_idx: int, err_text: str) -> tuple[bool, bool]:
-        """
-        Update state for a failing key.
-        Returns (should_switch_key, should_retry_same_key).
-        """
+        """Update state for a failing key and return (should_switch_key, should_retry_same_key)."""
         limiter = _get_global_rate_limiter()
         upper = err_text.upper()
         is_daily = "PERDAY" in upper or "GENERATEREQUESTSPERDAY" in upper
@@ -316,18 +313,30 @@ class AIClient:
         max_retries: int = 2,
         bypass_user_cooldown: bool = False,
     ) -> str:
-        """Blocks rapid requests up front, rotates across available keys on quota/429, and fails over models."""
+        """Cache-checks, spreads load round-robin across keys, and fails over automatically."""
+        safe_contents = self._sanitize_contents(contents)
+
+        # 0-API-cost cache check for identical text prompts
+        cache_key = None
+        if isinstance(safe_contents, str):
+            raw_sig = f"{system_instruction or ''}||{safe_contents}"
+            cache_key = hashlib.sha256(raw_sig.encode("utf-8")).hexdigest()
+            limiter = _get_global_rate_limiter()
+            with limiter["lock"]:
+                _roll_utc_day_if_needed(limiter)
+                cached = limiter["response_cache"].get(cache_key)
+                if cached:
+                    return cached
+
         allowed, block_message = self._check_and_reserve_slot(
             bypass_user_cooldown=bypass_user_cooldown
         )
         if not allowed:
             return block_message
 
-        safe_contents = self._sanitize_contents(contents)
-        config = (
-            types.GenerateContentConfig(system_instruction=system_instruction)
-            if system_instruction
-            else None
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
         )
 
         limiter = _get_global_rate_limiter()
@@ -348,9 +357,21 @@ class AIClient:
                             contents=safe_contents,
                             config=config,
                         )
+                        result_text = response.text or "⚠️ Empty response returned from model."
                         with limiter["lock"]:
-                            limiter["active_key_idx"] = key_idx
-                        return response.text or "⚠️ Empty response returned from model."
+                            # Round-robin advance so load spreads evenly across all healthy keys
+                            n = len(self.api_keys)
+                            if n > 1:
+                                for step in range(1, n + 1):
+                                    cand = (key_idx + step) % n
+                                    if not limiter["key_exhausted_day"].get(cand, False):
+                                        limiter["active_key_idx"] = cand
+                                        break
+                            if cache_key and response.text:
+                                if len(limiter["response_cache"]) > 100:
+                                    limiter["response_cache"].clear()
+                                limiter["response_cache"][cache_key] = result_text
+                        return result_text
                     except Exception as e:
                         last_error = str(e)
                         should_switch, should_retry = self._record_key_failure(key_idx, last_error)
@@ -372,7 +393,7 @@ class AIClient:
         status = self.get_quota_status()
         if status["total_keys"] > 0 and status["usable_keys"] == 0:
             return (
-                f"🛑 All {status['total_keys']} configured Gemini API key(s) hit daily free-tier quota limits. "
+                f"🛑 All {status['total_keys']} configured Gemini API key(s) hit daily quota limits. "
                 f"Detail: {last_error[:180]}"
             )
 
