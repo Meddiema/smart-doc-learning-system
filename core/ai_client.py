@@ -35,7 +35,6 @@ def _load_api_keys() -> list[str]:
     secret_names = (
         "GEMINI_API_KEYS",
         "GEMINI_API_KEY",
-        "GEMINI_API_KEY_1",
         "GEMINI_API_KEY_2",
         "GEMINI_API_KEY_3",
     )
